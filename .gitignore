@@ -1,0 +1,25 @@
+# DockPilot runtime config (per-machine; nothing personal should be committed)
+config/
+
+# EEPROM backups the app writes next to the script
+eeprom_*.bin
+asix_dump_*/
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
