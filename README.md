@@ -15,6 +15,19 @@ working configuration — it never leaves you stranded or guessing.
 > Everything is read straight from the Linux `/sys` filesystem, so the only dependency is
 > `customtkinter`. No proprietary drivers, no daemon, no telemetry, no personal data.
 
+![DockPilot dashboard](screenshots/01-dashboard.png)
+
+## Screenshots
+
+| | |
+|---|---|
+| **Dashboard** — live throughput, link health, reachability, chip identity | ![Dashboard](screenshots/01-dashboard.png) |
+| **Native mode** — detect the chip and unlock the manufacturer's driver | ![Native mode](screenshots/02-native-mode.png) |
+| **Wake-on-LAN** — arm the NIC and send magic packets to other machines | ![Wake-on-LAN](screenshots/03-wake-on-lan.png) |
+| **USB topology** — a live map of the dock's hubs, ports and devices | ![Topology](screenshots/04-topology.png) |
+| **Devices & power** — enable/disable individual devices behind the dock | ![USB & Power](screenshots/05-usb-power.png) |
+| **Automation** — rules that fire when the dock connects or disconnects | ![Automation](screenshots/06-automation.png) |
+
 ---
 
 ## What it does
@@ -96,7 +109,7 @@ and explains why — remembering the verdict per-dock so it won't retry blindly.
 Requires Python 3 with Tk (`python3-tk` on Debian/Ubuntu if your Python lacks it).
 
 ```bash
-git clone <your-repo-url> && cd dockpilot
+git clone https://github.com/dinnerisserved/dockpilot.git && cd dockpilot
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 python3 dockpilot.py
