@@ -8,12 +8,8 @@ detects the dock's chipset and, **where the hardware allows**, safely and revers
 unlocks the manufacturer's native mode (Wake-on-LAN, link tuning, EEPROM inspection),
 draws a live map of the dock's internals, and controls its USB devices and audio.
 
-Its guiding principle is **honesty**: it always gives you a result. Where a dock can do
-something, it unlocks it. Where a dock *can't*, it says so clearly and puts you back on a
-working configuration — it never leaves you stranded or guessing.
-
-> Everything is read straight from the Linux `/sys` filesystem, so the only dependency is
-> `customtkinter`. No proprietary drivers, no daemon, no telemetry, no personal data.
+Where a dock can do something, it unlocks it. Where a dock *can't*, it says so clearly and puts you back on a
+working configuration.
 
 ![DockPilot dashboard](screenshots/01-dashboard.png)
 
@@ -35,8 +31,7 @@ working configuration — it never leaves you stranded or guessing.
 - **Native-mode unlock (reversible).** Detects ASIX / Realtek dock NICs and, if they're in
   a limited plug-and-play (CDC) mode, offers a one-click switch to the native driver —
   then verifies the link actually comes up. If it does, native-only features appear. If it
-  doesn't, it auto-reverts to the working mode and tells you why. Per-dock memory means it
-  won't make you re-run a hopeless attempt twice.
+  doesn't, it auto-reverts to the working mode and tells you why. 
 - **Wake-on-LAN.** Arm the dock NIC to wake the machine over the wired link, and send magic
   packets to wake your other machines (pure Python, no external tool).
 - **Live dashboard.** Real-time throughput graph, link health (error/drop counters),
@@ -57,7 +52,7 @@ working configuration — it never leaves you stranded or guessing.
 ## What it does **not** do
 
 - It does not talk to HDMI/DisplayPort video or Power Delivery — those aren't on the USB
-  data bus and no USB tool can see them (it labels them as such rather than pretending).
+  data bus and no USB tool can see them (it labels them).
 - It cannot make a dock do something its silicon can't. Some chips (see below) engage
   native mode but their wired link never comes up — DockPilot diagnoses that and reverts,
   it does not "fix" the hardware.
@@ -68,9 +63,7 @@ working configuration — it never leaves you stranded or guessing.
 
 ## Tested hardware
 
-Every device below was tested on a real machine. This table is the honest map of what to
-expect — including the docks where native mode **doesn't** work, because knowing that is
-the point.
+Every device below was tested on a real machine. 
 
 | Device | NIC chip | Ships as | Native mode result |
 |---|---|---|---|
@@ -97,10 +90,10 @@ DockPilot handles both correctly: it unlocks the chips that work, and for the on
 don't, it engages native mode, detects the dead link, reverts to the working standard mode,
 and explains why — remembering the verdict per-dock so it won't retry blindly.
 
-> **Note on 2.5G:** the RTL8156 correctly *advertises* 2500baseT/Full; it will only *link*
-> at 2.5G if the other end (switch/router) is also 2.5G. On gigabit infrastructure it
-> negotiates to 1000Mb/s, which DockPilot reports accurately (advertised modes vs.
-> negotiated speed).
+**Note on 2.5G:** the RTL8156 correctly *advertises* 2500baseT/Full; it will only *link*
+at 2.5G if the other end (switch/router) is also 2.5G. On gigabit infrastructure it
+negotiates to 1000Mb/s, which DockPilot reports accurately (advertised modes vs.
+negotiated speed).
 
 ---
 
@@ -152,7 +145,7 @@ the Linux `ax88179_178a` and `r8152` drivers; Realtek's own udev rule for forcin
 mode; `uhubctl` for per-port power; `ethtool`, `fwupd`, and the sysfs USB/net interfaces.
 What DockPilot adds is the *synthesis*: detecting the chip, attempting the unlock,
 verifying it actually works, degrading honestly when it doesn't, and presenting it all in
-a friendly GUI — which, as far as the author could find, didn't previously exist for Linux.
+a friendly GUI.
 
 ## License
 
