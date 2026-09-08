@@ -101,14 +101,19 @@ negotiated speed).
 
 ### Option 1 — install via pip (recommended)
 
+Requires Python 3 with Tk (`python3-tk` on Debian/Ubuntu if your Python lacks it).
+
 ```bash
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 pip install dockpilot
-dockpilot```
+dockpilot
+```
 
-### Option 2 - Requires Python 3 with Tk (`python3-tk` on Debian/Ubuntu if your Python lacks it)
+### Option 2 — run from source
+
+Requires Python 3 with Tk (`python3-tk` on Debian/Ubuntu if your Python lacks it).
 
 ```bash
 git clone https://github.com/dinnerisserved/dockpilot.git && cd dockpilot
