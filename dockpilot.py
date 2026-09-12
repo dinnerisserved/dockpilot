@@ -19,7 +19,9 @@ Run inside a venv:
 
 import os
 import re
+import sys
 import json
+import platform
 import time
 import random
 import shutil
@@ -1943,6 +1945,88 @@ class MacroPage:
 # =========================================================================== #
 #  SYSTEM SNAPSHOT — one-click diagnostic dump
 # =========================================================================== #
+REDACT_IPS = True          # set False to include IPs (rarely needed for dock diagnosis)
+
+
+# --------------------------------------------------------------------------- #
+def _snap_snap_run(cmd, timeout=10):
+    """Run a command, return its output or an honest 'not available' note."""
+    exe = cmd[0]
+    if shutil.which(exe) is None:
+        return "[%s not installed]" % exe
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        out = ((p.stdout or "") + (p.stderr or "")).strip()
+        return out or "[no output]"
+    except Exception as e:
+        return "[error running %s: %s]" % (" ".join(cmd), e)
+
+
+def _snap_read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return "[unavailable]"
+
+
+def _redact(text):
+    """Strip IPv4/IPv6 addresses and the hostname so snapshots are safe to paste publicly."""
+    if not REDACT_IPS:
+        return text
+    text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<ip>", text)
+    text = re.sub(r"\b(?:[0-9a-fA-F]{0,4}:){3,7}[0-9a-fA-F]{0,4}\b", "<ipv6>", text)
+    host = platform.node()
+    if host:
+        text = text.replace(host, "<host>")
+    return text
+
+
+def _section(title, body):
+    return "\n=== %s ===\n%s\n" % (title, body)
+
+
+# --------------------------------------------------------------------------- #
+def _usb_ancestry(iface):
+    """Walk from the NIC up to its USB device dir; report chip IDs along the way."""
+    if not iface:
+        return "[no dock NIC]"
+    real = os.path.realpath("/sys/class/net/%s/device" % iface)
+    lines = ["resolved device path: %s" % real]
+    p, hops = real, 0
+    while p and p != "/" and hops < 8:
+        vid, pid = _snap_read(os.path.join(p, "idVendor")), _snap_read(os.path.join(p, "idProduct"))
+        if vid != "[unavailable]" and pid != "[unavailable]":
+            lines.append("  %s  %s:%s  %s %s  (cfg %s of %s)" % (
+                os.path.basename(p), vid, pid,
+                _snap_read(os.path.join(p, "manufacturer")),
+                _snap_read(os.path.join(p, "product")),
+                _snap_read(os.path.join(p, "bConfigurationValue")),
+                _snap_read(os.path.join(p, "bNumConfigurations")),
+            ))
+        p = os.path.dirname(p)
+        hops += 1
+    return "\n".join(lines)
+
+
+def _net_stats(iface):
+    if not iface:
+        return "[no dock NIC]"
+    base = "/sys/class/net/%s" % iface
+    keys = ["rx_bytes", "tx_bytes", "rx_errors", "tx_errors",
+            "rx_dropped", "tx_dropped", "rx_crc_errors"]
+    out = ["operstate: %s" % _snap_read(base + "/operstate"),
+           "carrier:   %s" % _snap_read(base + "/carrier"),
+           "speed:     %s" % _snap_read(base + "/speed"),
+           "mtu:       %s" % _snap_read(base + "/mtu"),
+           "address:   %s" % _snap_read(base + "/address")]
+    for k in keys:
+        v = _snap_read("%s/statistics/%s" % (base, k))
+        if v != "[unavailable]":
+            out.append("%-14s %s" % (k + ":", v))
+    return "\n".join(out)
+
+
 def _mcu_state():
     """Placeholder: future DockPilot-protocol docks (an MCU running our firmware)
     will report IDENTIFY / CAPS / STATUS here."""
