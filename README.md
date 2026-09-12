@@ -8,6 +8,8 @@ detects the dock's chipset and, **where the hardware allows**, safely and revers
 unlocks the manufacturer's native mode (Wake-on-LAN, link tuning, EEPROM inspection),
 draws a live map of the dock's internals, and controls its USB devices and audio.
 
+Where a dock can do something, it unlocks it. Where a dock *can't*, it says so clearly and puts you back on a working configuration.
+
 ![DockPilot dashboard](screenshots/01-dashboard.png)
 
 ## Screenshots
@@ -54,7 +56,7 @@ draws a live map of the dock's internals, and controls its USB devices and audio
   native mode but their wired link never comes up — DockPilot diagnoses that and reverts,
   it does not "fix" the hardware.
 - It writes nothing to any EEPROM/eFuse. Inspection only.
-- Linux only. Uses NetworkManager for some conveniences.
+- Linux only. Uses NetworkManager for some conveniences (degrades gracefully without it).
 
 ---
 
@@ -71,6 +73,7 @@ Every device below was tested on a real machine.
 | uni USB-C Hub 6-in-1 | Realtek **RTL8153** | `r8152` | ✅ already native out of the box |
 | TP-Link UE302C (2.5G) | Realtek **RTL8156** | `r8152` | ✅ already native; advertises 2500baseT/Full |
 | MOKiN / C-Smartlink DK1903A (Thunderbolt 4, 12-in-1) | Realtek **RTL8156B** | `r8152` | ✅ already native; works fully over Thunderbolt |
+| ASIX AX88772B USB-A adapter (10/100) | ASIX **AX88772B** | `asix` | ✅ single USB config — nothing to unlock; correctly offers no native mode |
 | Lemorele 10-in-1 | *(no NIC)* | — | ✅ graceful: "no network chip", topology still drawn |
 
 ### The key finding
@@ -131,7 +134,7 @@ and **no personal data ships with the project**:
 
 ## Notes
 
-Detail for people who want it
+Detail for people who want it — skip unless you're digging in.
 
 **How native-mode unlock works.** USB devices can present multiple *configurations*. Many
 ASIX/Realtek dock NICs ship on a generic CDC config (driven by `cdc_ncm`/`cdc_ether`), which
@@ -160,6 +163,13 @@ end is also 2.5G; on gigabit infrastructure it negotiates to 1000Mb/s. DockPilot
 advertised modes and negotiated speed separately. On one dock `ethtool` misreported the
 advertised modes (claiming 10baseT on a 2.5G chip) while sysfs correctly showed 1000 —
 worth knowing that advertised-modes output isn't always trustworthy.
+
+**EEPROM in practice.** Across nine devices, only one exposes a readable EEPROM: the older ASIX
+**AX88772B**, where the layout is fully decodable — MAC at `0x0008`, VID/PID at `0x0048`, vendor
+strings at `0xC0`. Everything else reads back as all-`FF` (the chip uses one-time eFuse) or reports
+no EEPROM access at all. Writing was rejected on every device tested; on the AX88772B the driver
+logs *"Failed to enable software MII access"*, so `ethtool -E` can't reach the write path.
+DockPilot therefore treats EEPROM as **read-only**, which is all it ever claimed to do.
 
 **Built on.** The Linux `ax88179_178a` and `r8152` drivers; Realtek's own udev rule for
 forcing native mode; `uhubctl` for per-port power; `ethtool`, `fwupd`, and the sysfs USB/net

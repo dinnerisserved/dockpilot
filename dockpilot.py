@@ -40,6 +40,8 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 #  config — beside the script only
 # --------------------------------------------------------------------------- #
+APP_VERSION = "0.2.0"
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(SCRIPT_DIR, "config")
 DEVICES_FILE = os.path.join(CONFIG_DIR, "devices.json")
@@ -599,6 +601,7 @@ class DockPilot(ctk.CTk):
         self.prev_link = net_carrier(self.iface) if self.iface else False
         self.current = None
         self.log_lines = []
+        self.macro_store = MacroStore()
         self.privshell = PrivShell()
 
         auto = load_json(AUTOMATION_FILE, {})
@@ -638,7 +641,7 @@ class DockPilot(ctk.CTk):
         bar.grid(row=1, column=0, sticky="nsw"); bar.grid_propagate(False)
         self.nav_buttons = {}
         for name in ("Dashboard", "Identity", "Native Mode", "Network", "USB & Power",
-                     "Topology", "Audio", "Automation", "Logs"):
+                     "Topology", "Audio", "Automation", "Macros", "Logs"):
             b = ctk.CTkButton(bar, text=name, anchor="w", corner_radius=8, height=38,
                               fg_color="transparent", hover_color=("#1b2027", "#1b2027"),
                               command=lambda n=name: self.show(n))
@@ -663,7 +666,8 @@ class DockPilot(ctk.CTk):
             "Native Mode": self._page_native,
             "Network": self._page_network, "USB & Power": self._page_usb,
             "Topology": self._page_topology, "Audio": self._page_audio,
-            "Automation": self._page_automation, "Logs": self._page_logs,
+            "Automation": self._page_automation, "Macros": self._page_macros,
+            "Logs": self._page_logs,
         }[name](wrap)
 
     # ---------- reusable card ----------
@@ -1108,11 +1112,32 @@ class DockPilot(ctk.CTk):
         ctk.CTkEntry(dc, textvariable=self.disconnect_cmd, width=460, placeholder_text="e.g. notify-send 'Undocked'").pack(side="left")
 
     # ---------- Logs ----------
+    def _page_macros(self, w):
+        MacroPage(self.macro_store, self).build(w)
+
+    def _save_snapshot(self):
+        try:
+            path = write_snapshot(iface=self.iface, log_lines=self.log_lines,
+                                  dockpilot_version=APP_VERSION)
+            self.log("# snapshot written: %s" % path)
+            messagebox.showinfo("System Snapshot",
+                "Diagnostic snapshot saved:\n\n%s\n\nIPs and hostname are redacted — safe to "
+                "attach to a GitHub issue." % path)
+        except Exception as e:
+            messagebox.showerror("System Snapshot", "Couldn't write snapshot: %s" % e)
+
     def _page_logs(self, w):
         c = self._card(w, "Command log", "Every action that changes something is echoed here.")
         self.logbox = ctk.CTkTextbox(c, font=ctk.CTkFont(family="monospace", size=12), height=420)
         self.logbox.pack(fill="both", expand=True, padx=10, pady=10)
         self.logbox.insert("end", "\n".join(self.log_lines) + "\n"); self.logbox.see("end")
+
+        sc = self._card(w, "System Snapshot",
+                        "Writes one diagnostic file with the dock's chips, drivers, USB topology, "
+                        "link stats and this log. IPs and hostname are redacted, so it's safe to "
+                        "attach to a bug report.")
+        b = ctk.CTkButton(sc, text="📋  Save System Snapshot", command=self._save_snapshot)
+        b.pack(anchor="w", padx=16, pady=(4, 14))
 
     def log(self, msg):
         line = msg.rstrip()
@@ -1533,6 +1558,14 @@ class DockPilot(ctk.CTk):
         cmd = (self.connect_cmd if connected else self.disconnect_cmd).get().strip()
         if cmd:
             self.do(["bash", "-c", cmd])
+        # user-defined macros (macros.py) — scoped to this dock's chip when known
+        if self.macro_store:
+            c = nic_chip(self.iface) if self.iface else None
+            model = (c.get("product") or "") if c else ""
+            n = run_macros(self.macro_store, "connect" if connected else "disconnect",
+                           log=self.log, dock_model=model)
+            if n:
+                self.log("# %d macro(s) fired" % n)
 
     # ---------- 1 Hz tick ----------
     def _tick(self):
@@ -1566,3 +1599,416 @@ class DockPilot(ctk.CTk):
 
 if __name__ == "__main__":
     DockPilot().mainloop()
+
+
+# =========================================================================== #
+#  MACROS — user-defined commands fired on dock connect/disconnect
+#  (merged in; no assumptions about the user's system)
+# =========================================================================== #
+MACROS_FILE = os.path.join(CONFIG_DIR, "macros.json")
+
+TRIGGERS = ["connect", "disconnect", "port_on", "port_off"]
+
+ACCENT = "#2fbf5f"
+AMBER = "#e0a13a"
+CARD = ("#1b2027", "#1b2027")
+
+
+# --------------------------------------------------------------------------- #
+#  Starter templates — editable examples, NOT defaults that run.
+#  Deliberately generic: we don't know the user's desktop, apps or scripts.
+#  Every one is created disabled so nothing ever fires unexpectedly.
+# --------------------------------------------------------------------------- #
+TEMPLATES = [
+    {
+        "name": "Notify on dock/undock",
+        "trigger": "connect",
+        "dock": "",
+        "enabled": False,
+        "commands": ['notify-send "Docked" "Dock connected"'],
+        "note": "Simplest possible macro. Needs a desktop that has notify-send.",
+    },
+    {
+        "name": "Lock screen on undock",
+        "trigger": "disconnect",
+        "dock": "",
+        "enabled": False,
+        "commands": ["loginctl lock-session"],
+        "note": "Walk-away security. Your desktop may use a different lock command.",
+    },
+    {
+        "name": "Mute audio on undock",
+        "trigger": "disconnect",
+        "dock": "",
+        "enabled": False,
+        "commands": ["pactl set-sink-mute @DEFAULT_SINK@ 1"],
+        "note": "Stops sound blasting from laptop speakers when you unplug.",
+    },
+    {
+        "name": "Run my own script on connect",
+        "trigger": "connect",
+        "dock": "",
+        "enabled": False,
+        "commands": ["$HOME/bin/on-dock.sh"],
+        "note": "The flexible one: point it at your own script and do whatever you like.",
+    },
+    {
+        "name": "Restore monitor layout on connect",
+        "trigger": "connect",
+        "dock": "",
+        "enabled": False,
+        "commands": ["# X11 example — edit for your setup:",
+                     "# xrandr --output HDMI-1 --auto --right-of eDP-1",
+                     "# Wayland users: wlr-randr or kanshi instead"],
+        "note": "Display layout is desktop-specific, so this is a stub to edit. "
+                "DockPilot deliberately doesn't try to be a window manager.",
+    },
+]
+
+
+# --------------------------------------------------------------------------- #
+#  Store
+# --------------------------------------------------------------------------- #
+class MacroStore:
+    def __init__(self, path=MACROS_FILE):
+        self.path = path
+        self.macros = []
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                data = json.load(f)
+            self.macros = data if isinstance(data, list) else []
+        except Exception:
+            self.macros = []
+        return self.macros
+
+    def save(self):
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "w") as f:
+                json.dump(self.macros, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def add(self, macro):
+        self.macros.append(macro)
+        self.save()
+
+    def remove(self, idx):
+        if 0 <= idx < len(self.macros):
+            self.macros.pop(idx)
+            self.save()
+
+    def update(self, idx, macro):
+        if 0 <= idx < len(self.macros):
+            self.macros[idx] = macro
+            self.save()
+
+    def add_templates(self):
+        """Add any starter templates not already present (by name). All disabled."""
+        have = {m.get("name") for m in self.macros}
+        added = 0
+        for t in TEMPLATES:
+            if t["name"] not in have:
+                m = dict(t)
+                m.pop("note", None)
+                self.macros.append(m)
+                added += 1
+        if added:
+            self.save()
+        return added
+
+    def matching(self, trigger, dock_model=""):
+        out = []
+        for m in self.macros:
+            if not m.get("enabled"):
+                continue
+            if m.get("trigger") != trigger:
+                continue
+            want = (m.get("dock") or "").strip()
+            if want and want != (dock_model or ""):
+                continue
+            out.append(m)
+        return out
+
+
+# --------------------------------------------------------------------------- #
+#  Runner
+# --------------------------------------------------------------------------- #
+def run_commands(commands, log=None, env_extra=None):
+    """Run a list of shell commands in order, on a worker thread. Never raises."""
+    def worker():
+        env = dict(os.environ)
+        if env_extra:
+            env.update({k: str(v) for k, v in env_extra.items()})
+        for cmd in commands:
+            c = (cmd or "").strip()
+            if not c or c.startswith("#"):
+                continue                      # blank lines and comments are skipped
+            if log:
+                log("$ %s" % c)
+            try:
+                p = subprocess.run(c, shell=True, capture_output=True, text=True,
+                                   timeout=60, env=env)
+                out = ((p.stdout or "") + (p.stderr or "")).strip()
+                if log and out:
+                    log(out[:500])
+                if log and p.returncode != 0:
+                    log("(exit %d)" % p.returncode)
+            except subprocess.TimeoutExpired:
+                if log:
+                    log("(timed out after 60s)")
+            except Exception as e:
+                if log:
+                    log("(error: %s)" % e)
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def run_macros(store, trigger, log=None, dock_model="", **env_extra):
+    """Fire every enabled macro matching this trigger (and dock, if scoped)."""
+    fired = 0
+    for m in store.matching(trigger, dock_model):
+        if log:
+            log("# macro: %s (%s)" % (m.get("name", "unnamed"), trigger))
+        run_commands(m.get("commands", []), log=log, env_extra=env_extra)
+        fired += 1
+    return fired
+
+
+# --------------------------------------------------------------------------- #
+#  GUI page
+# --------------------------------------------------------------------------- #
+class MacroPage:
+    def __init__(self, store=None, app=None):
+        self.store = store or MacroStore()
+        self.app = app
+        self.parent = None
+
+    def log(self, msg):
+        if self.app and hasattr(self.app, "log"):
+            self.app.log(msg)
+
+    def build(self, w):
+        self.parent = w
+        intro = ctk.CTkFrame(w, corner_radius=12, fg_color=CARD)
+        intro.pack(fill="x", padx=10, pady=8)
+        ctk.CTkLabel(intro, text="Macros", font=ctk.CTkFont(size=15, weight="bold")
+                     ).pack(anchor="w", padx=16, pady=(12, 2))
+        ctk.CTkLabel(
+            intro,
+            text=("Run your own commands when the dock connects or disconnects. DockPilot makes "
+                  "no assumptions about your system — you write the commands. Templates below are "
+                  "editable starting points; nothing runs unless you enable it."),
+            justify="left", wraplength=820, text_color=("gray55", "gray55")
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+        row = ctk.CTkFrame(intro, fg_color="transparent"); row.pack(fill="x", padx=16, pady=(0, 12))
+        ctk.CTkButton(row, text="+ New macro", command=self._new).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(row, text="Add starter templates", fg_color="#5a5f6a",
+                      hover_color="#474b54", command=self._templates).pack(side="left")
+
+        self.list_frame = ctk.CTkFrame(w, fg_color="transparent")
+        self.list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._refresh()
+        return w
+
+    def _refresh(self):
+        for wdg in self.list_frame.winfo_children():
+            wdg.destroy()
+        if not self.store.macros:
+            ctk.CTkLabel(self.list_frame,
+                         text="No macros yet. Create one, or add the starter templates above.",
+                         text_color=("gray55", "gray55")).pack(anchor="w", padx=16, pady=12)
+            return
+        for i, m in enumerate(self.store.macros):
+            c = ctk.CTkFrame(self.list_frame, corner_radius=12, fg_color=CARD)
+            c.pack(fill="x", pady=6)
+            top = ctk.CTkFrame(c, fg_color="transparent"); top.pack(fill="x", padx=16, pady=(12, 4))
+            var = tk.BooleanVar(value=bool(m.get("enabled")))
+            ctk.CTkSwitch(top, text="", variable=var, width=44,
+                          command=lambda i=i, v=var: self._toggle(i, v)).pack(side="left")
+            ctk.CTkLabel(top, text=m.get("name", "unnamed"),
+                         font=ctk.CTkFont(size=14, weight="bold")).pack(side="left", padx=8)
+            scope = m.get("dock") or "any dock"
+            ctk.CTkLabel(top, text="   on %s · %s" % (m.get("trigger", "?"), scope),
+                         text_color=("gray55", "gray55")).pack(side="left")
+            ctk.CTkButton(top, text="Delete", width=70, fg_color="#b4552d",
+                          hover_color="#8f3f1e",
+                          command=lambda i=i: self._delete(i)).pack(side="right", padx=4)
+            ctk.CTkButton(top, text="Edit", width=60,
+                          command=lambda i=i: self._edit(i)).pack(side="right", padx=4)
+            ctk.CTkButton(top, text="Run now", width=80, fg_color="#5a5f6a",
+                          hover_color="#474b54",
+                          command=lambda i=i: self._run(i)).pack(side="right", padx=4)
+            body = "\n".join(m.get("commands", [])) or "(no commands)"
+            ctk.CTkLabel(c, text=body, justify="left", anchor="w",
+                         font=ctk.CTkFont(family="monospace", size=12),
+                         text_color=("gray60", "gray60"), wraplength=800
+                         ).pack(anchor="w", padx=16, pady=(0, 12))
+
+    # ---- actions ----
+    def _toggle(self, idx, var):
+        self.store.macros[idx]["enabled"] = bool(var.get())
+        self.store.save()
+
+    def _delete(self, idx):
+        name = self.store.macros[idx].get("name", "this macro")
+        if messagebox.askyesno("Delete macro", "Delete %r?" % name):
+            self.store.remove(idx)
+            self._refresh()
+
+    def _run(self, idx):
+        m = self.store.macros[idx]
+        if not messagebox.askyesno("Run macro",
+                                   "Run %r now?\n\nThis executes its commands immediately."
+                                   % m.get("name", "macro")):
+            return
+        self.log("# macro (manual): %s" % m.get("name"))
+        run_commands(m.get("commands", []), log=self.log)
+
+    def _templates(self):
+        n = self.store.add_templates()
+        self._refresh()
+        messagebox.showinfo("Templates",
+                            "Added %d starter template(s), all disabled.\n\n"
+                            "They're examples — edit the commands for your system, then enable "
+                            "the ones you want." % n if n else
+                            "All starter templates are already present.")
+
+    def _new(self):
+        self._editor(None)
+
+    def _edit(self, idx):
+        self._editor(idx)
+
+    def _editor(self, idx):
+        existing = self.store.macros[idx] if idx is not None else {
+            "name": "", "trigger": "connect", "dock": "", "enabled": False, "commands": []}
+
+        win = ctk.CTkToplevel(self.parent)
+        win.title("Edit macro" if idx is not None else "New macro")
+        win.geometry("640x520")
+        win.transient(self.parent.winfo_toplevel())
+        win.after(100, win.lift)
+
+        ctk.CTkLabel(win, text="Name").pack(anchor="w", padx=16, pady=(14, 2))
+        name = ctk.CTkEntry(win, width=560); name.pack(padx=16)
+        name.insert(0, existing.get("name", ""))
+
+        ctk.CTkLabel(win, text="Trigger").pack(anchor="w", padx=16, pady=(12, 2))
+        trig = ctk.CTkOptionMenu(win, values=TRIGGERS, width=200)
+        trig.set(existing.get("trigger", "connect")); trig.pack(anchor="w", padx=16)
+
+        ctk.CTkLabel(win, text="Only for dock model (blank = any dock)"
+                     ).pack(anchor="w", padx=16, pady=(12, 2))
+        dock = ctk.CTkEntry(win, width=300, placeholder_text="e.g. opendock-v1")
+        dock.pack(anchor="w", padx=16)
+        dock.insert(0, existing.get("dock", ""))
+
+        ctk.CTkLabel(win, text="Commands — one per line. Lines starting with # are ignored."
+                     ).pack(anchor="w", padx=16, pady=(12, 2))
+        cmds = ctk.CTkTextbox(win, height=170, font=ctk.CTkFont(family="monospace", size=12))
+        cmds.pack(fill="x", padx=16)
+        cmds.insert("1.0", "\n".join(existing.get("commands", [])))
+
+        ctk.CTkLabel(win, text="Commands run in order, in a shell, with a 60s timeout each. "
+                              "Output goes to the Logs page.",
+                     text_color=("gray55", "gray55"), justify="left", wraplength=560
+                     ).pack(anchor="w", padx=16, pady=(6, 0))
+
+        def save():
+            m = {
+                "name": name.get().strip() or "unnamed",
+                "trigger": trig.get(),
+                "dock": dock.get().strip(),
+                "enabled": bool(existing.get("enabled")),
+                "commands": [l for l in cmds.get("1.0", "end").splitlines()],
+            }
+            if idx is None:
+                self.store.add(m)
+            else:
+                self.store.update(idx, m)
+            win.destroy()
+            self._refresh()
+
+        row = ctk.CTkFrame(win, fg_color="transparent"); row.pack(fill="x", padx=16, pady=14)
+        ctk.CTkButton(row, text="Save", command=save).pack(side="left")
+        ctk.CTkButton(row, text="Cancel", fg_color="#5a5f6a", hover_color="#474b54",
+                      command=win.destroy).pack(side="left", padx=8)
+
+
+# --------------------------------------------------------------------------- #
+
+
+# =========================================================================== #
+#  SYSTEM SNAPSHOT — one-click diagnostic dump
+# =========================================================================== #
+def _mcu_state():
+    """Placeholder: future DockPilot-protocol docks (an MCU running our firmware)
+    will report IDENTIFY / CAPS / STATUS here."""
+    return "[no DockPilot-protocol dock detected]"
+
+# --------------------------------------------------------------------------- #
+def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown"):
+    """Assemble the full diagnostic report as a string."""
+    parts = []
+    parts.append("DockPilot System Snapshot")
+    parts.append("generated: %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    parts.append("DockPilot version: %s" % dockpilot_version)
+    parts.append("(IPs and hostname are redacted; MAC addresses are kept — they identify the NIC chip)")
+
+    # --- system ---
+    parts.append(_section("SYSTEM", "\n".join([
+        "python:  %s" % sys.version.split()[0],
+        "kernel:  %s" % platform.release(),
+        "arch:    %s" % platform.machine(),
+        "distro:  %s" % _snap_read("/etc/os-release").split("\n")[0].replace('PRETTY_NAME=', '').strip('"'),
+    ])))
+
+    # --- tool availability (explains why sections may be empty) ---
+    tools = ["ethtool", "lsusb", "uhubctl", "nmcli", "pactl", "ip", "fwupdmgr"]
+    parts.append(_section("TOOLS AVAILABLE", "\n".join(
+        "%-10s %s" % (t, "yes" if shutil.which(t) else "NOT INSTALLED") for t in tools)))
+
+    # --- dock NIC ---
+    parts.append(_section("DOCK NIC", "interface: %s" % (iface or "[none detected]")))
+    if iface:
+        parts.append(_section("NIC DRIVER (ethtool -i)", _snap_snap_run(["ethtool", "-i", iface])))
+        parts.append(_section("NIC LINK (ethtool)", _redact(_snap_snap_run(["ethtool", iface]))))
+        parts.append(_section("NIC STATS (sysfs)", _net_stats(iface)))
+        parts.append(_section("USB ANCESTRY / CHIP IDs", _usb_ancestry(iface)))
+
+    # --- USB ---
+    parts.append(_section("USB DEVICES (lsusb)", _snap_snap_run(["lsusb"])))
+    parts.append(_section("USB TREE (lsusb -t)", _snap_snap_run(["lsusb", "-t"])))
+
+    # --- network interfaces (redacted) ---
+    parts.append(_section("INTERFACES (ip -br addr)", _redact(_snap_snap_run(["ip", "-br", "addr"]))))
+
+    # --- MCU / protocol dock ---
+    parts.append(_section("DOCKPILOT-PROTOCOL DOCK (MCU)", _mcu_state()))
+
+    # --- app command log ---
+    if log_lines:
+        parts.append(_section("DOCKPILOT COMMAND LOG (last 200)",
+                              _redact("\n".join(log_lines[-200:]))))
+    else:
+        parts.append(_section("DOCKPILOT COMMAND LOG", "[none]"))
+
+    parts.append("\n--- end of snapshot ---\n")
+    return "\n".join(parts)
+
+
+def write_snapshot(iface=None, log_lines=None, dockpilot_version="unknown", directory=None):
+    """Build the snapshot and write it to a timestamped file. Returns the path."""
+    text = build_snapshot(iface, log_lines, dockpilot_version)
+    directory = directory or os.path.expanduser("~")
+    path = os.path.join(directory, "dockpilot-snapshot-%s.txt" % time.strftime("%Y%m%d-%H%M%S"))
+    with open(path, "w") as f:
+        f.write(text)
+    return path
+
+
+
