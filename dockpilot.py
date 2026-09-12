@@ -1597,8 +1597,6 @@ class DockPilot(ctk.CTk):
         self.after(1000, self._tick)
 
 
-if __name__ == "__main__":
-    DockPilot().mainloop()
 
 
 # =========================================================================== #
@@ -2011,4 +2009,5 @@ def write_snapshot(iface=None, log_lines=None, dockpilot_version="unknown", dire
     return path
 
 
-
+if __name__ == "__main__":
+    DockPilot().mainloop()
