@@ -42,10 +42,30 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 #  config — beside the script only
 # --------------------------------------------------------------------------- #
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.3.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_DIR = os.path.join(SCRIPT_DIR, "config")
+def _pick_config_dir():
+    """Prefer ./config next to the script; fall back to ~/.config/dockpilot when the
+    script directory isn't writable (e.g. a system-wide pip install into site-packages)."""
+    local = os.path.join(SCRIPT_DIR, "config")
+    try:
+        os.makedirs(local, exist_ok=True)
+        probe = os.path.join(local, ".writetest")
+        with open(probe, "w") as f:
+            f.write("")
+        os.remove(probe)
+        return local
+    except Exception:
+        home = os.path.join(os.path.expanduser("~"), ".config", "dockpilot")
+        try:
+            os.makedirs(home, exist_ok=True)
+        except Exception:
+            pass
+        return home
+
+
+CONFIG_DIR = _pick_config_dir()
 DEVICES_FILE = os.path.join(CONFIG_DIR, "devices.json")
 STATE_FILE = os.path.join(CONFIG_DIR, "dock_state.json")
 AUTOMATION_FILE = os.path.join(CONFIG_DIR, "automation.json")
@@ -190,6 +210,34 @@ def iface_is_wifi(name):
 def usb_eth_ifaces():
     return [n for n in list_ifaces() if iface_is_usb(n)]
 
+def in_dialout_group():
+    """Serial/dock access needs the user in the 'dialout' group on most distros."""
+    try:
+        import grp
+        if os.geteuid() == 0:
+            return True
+        return "dialout" in {grp.getgrgid(g).gr_name for g in os.getgroups()}
+    except Exception:
+        return True          # can't tell — don't cry wolf
+
+
+def serial_ports_present():
+    try:
+        return any(n.startswith(("ttyACM", "ttyUSB")) for n in os.listdir("/dev"))
+    except Exception:
+        return False
+
+
+def dialout_hint():
+    """Hint string if serial ports exist but we lack permission to open them, else ''."""
+    if serial_ports_present() and not in_dialout_group():
+        return ("Serial device(s) are present, but your user isn't in the 'dialout' group — "
+                "DockPilot can't open them.\n\n"
+                "Fix:  sudo usermod -aG dialout $USER\n"
+                "then log out and back in.")
+    return ""
+
+
 def find_dock_iface():
     return usb_eth_ifaces()[0] if usb_eth_ifaces() else ""
 
@@ -310,8 +358,12 @@ def eeprom_backup(iface):
 
 
 def net_speed(name):
-    s = read_sys(f"/sys/class/net/{name}/speed")
-    return f"{s} Mb/s" if s and s != "-1" else "—"
+    """Negotiated link speed. Prefer sysfs: some drivers (seen on RTL8156B) misreport
+    advertised modes via ethtool while /sys/class/net/*/speed is correct."""
+    s_val = read_sys(f"/sys/class/net/{name}/speed")
+    if s_val and s_val not in ("-1", "0"):
+        return f"{s_val} Mb/s"
+    return "—"
 
 def net_driver(name):
     link = f"/sys/class/net/{name}/device/driver"
@@ -610,10 +662,9 @@ class DockPilot(ctk.CTk):
         self.rule_wifi = tk.BooleanVar(value=bool(auto.get("wifi", False)))
         self.rule_mac = tk.BooleanVar(value=bool(auto.get("mac", False)))
         self.rule_audio = tk.BooleanVar(value=bool(auto.get("audio", False)))
-        self.connect_cmd = tk.StringVar(value=auto.get("connect_cmd", ""))
-        self.disconnect_cmd = tk.StringVar(value=auto.get("disconnect_cmd", ""))
+
         for v in (self.rule_wifi, self.rule_mac, self.rule_audio,
-                  self.connect_cmd, self.disconnect_cmd):
+                  ):
             v.trace_add("write", lambda *_: self._save_automation())
 
         self.grid_rowconfigure(1, weight=1)
@@ -865,7 +916,49 @@ class DockPilot(ctk.CTk):
         sw.pack(anchor="w", padx=18, pady=(6, 14))
         if not have("nmcli"):
             sw.configure(state="disabled"); tip(sw, "Needs NetworkManager (nmcli).")
+
+        hint = dialout_hint()
+        if hint:
+            hc = self._card(w, "Serial permission", hint)
+
+        if have("nmcli"):
+            nc = self._card(w, "NetworkManager tidy-up",
+                            "Switching dock modes repeatedly can leave behind unused 'Wired "
+                            "connection N' profiles. This removes ones not attached to any device.")
+            ctk.CTkButton(nc, text="Find & remove unused wired profiles",
+                          command=self._nm_cleanup).pack(anchor="w", padx=16, pady=(4, 14))
+
         self._build_wire_tuning(w)
+
+    def _nm_duplicate_profiles(self):
+        """NetworkManager wired profiles not attached to a device. Heavy native-mode
+        flipping accumulates duplicate 'Wired connection N' entries."""
+        if not have("nmcli"):
+            return []
+        rc, out = run(["nmcli", "-t", "-f", "NAME,TYPE,DEVICE", "connection", "show"])
+        dupes = []
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) < 3 or "ethernet" not in parts[1]:
+                continue
+            name, dev = parts[0], parts[2]
+            if not dev or dev == "--":
+                dupes.append(name)
+        return sorted(set(dupes))
+
+    def _nm_cleanup(self):
+        dupes = self._nm_duplicate_profiles()
+        if not dupes:
+            messagebox.showinfo("NetworkManager", "No unused wired profiles found.")
+            return
+        if not messagebox.askyesno("Remove unused wired profiles?",
+                "These wired profiles aren't attached to any device:\n\n"
+                + "\n".join("  - " + d for d in dupes)
+                + "\n\nDelete them? Active connections are never touched."):
+            return
+        for name in dupes:
+            self.do(["nmcli", "connection", "delete", name],
+                    note="remove unused wired profile %r" % name)
 
     def _build_wire_tuning(self, w):
         state, c = native_state(self.iface)
@@ -1102,16 +1195,12 @@ class DockPilot(ctk.CTk):
                         variable=self.rule_mac).pack(anchor="w", padx=18, pady=4)
         ctk.CTkCheckBox(c, text="On connect: switch audio output to the dock",
                         variable=self.rule_audio).pack(anchor="w", padx=18, pady=(4, 12))
-        m = self._card(w, "Macros (custom actions)",
-                       "Run any shell command on connect or disconnect. This is your playground — mount a "
-                       "drive, launch apps, set a wallpaper, kick off a backup. Left empty, nothing runs. "
-                       "(Saved-macro presets are coming; for now these apply for the current session.)")
-        cc = ctk.CTkFrame(m, fg_color="transparent"); cc.pack(fill="x", padx=18, pady=(6, 4))
-        ctk.CTkLabel(cc, text="On connect:", width=120, anchor="w").pack(side="left")
-        ctk.CTkEntry(cc, textvariable=self.connect_cmd, width=460, placeholder_text="e.g. notify-send 'Docked'").pack(side="left")
-        dc = ctk.CTkFrame(m, fg_color="transparent"); dc.pack(fill="x", padx=18, pady=(4, 14))
-        ctk.CTkLabel(dc, text="On disconnect:", width=120, anchor="w").pack(side="left")
-        ctk.CTkEntry(dc, textvariable=self.disconnect_cmd, width=460, placeholder_text="e.g. notify-send 'Undocked'").pack(side="left")
+        m = self._card(w, "Custom commands",
+                       "Want to run your own commands on connect or disconnect? That lives on the "
+                       "Macros page — named macros, multiple commands each, and they can be scoped "
+                       "to a specific dock.")
+        ctk.CTkButton(m, text="Open Macros", width=140,
+                      command=lambda: self.show("Macros")).pack(anchor="w", padx=18, pady=(4, 14))
 
     # ---------- Logs ----------
     def _page_macros(self, w):
@@ -1538,8 +1627,6 @@ class DockPilot(ctk.CTk):
             "wifi": self.rule_wifi.get(),
             "mac": self.rule_mac.get(),
             "audio": self.rule_audio.get(),
-            "connect_cmd": self.connect_cmd.get(),
-            "disconnect_cmd": self.disconnect_cmd.get(),
         })
 
     def _on_transition(self, connected):
@@ -1551,15 +1638,16 @@ class DockPilot(ctk.CTk):
                 src = primary_host_iface(self.iface)
                 if src:
                     self._set_mac(net_mac(src))
-            else:
+            elif os.path.exists(f"/sys/class/net/{self.iface}"):
                 self._mac_restore()   # back to the dock's OWN original MAC
+            else:
+                # the NIC is already gone (dock physically unplugged) — nothing to restore.
+                # It comes back with its factory MAC on next plug-in anyway.
+                self.log("# MAC restore skipped — interface no longer present")
         if self.rule_audio.get() and connected and have("pactl"):
             for s in list_sinks():
                 if "usb" in s.lower():
                     self.do(["pactl", "set-default-sink", s]); break
-        cmd = (self.connect_cmd if connected else self.disconnect_cmd).get().strip()
-        if cmd:
-            self.do(["bash", "-c", cmd])
         # user-defined macros (macros.py) — scoped to this dock's chip when known
         if self.macro_store:
             c = nic_chip(self.iface) if self.iface else None

@@ -2,13 +2,9 @@
 
 A vendor-neutral **admin console for USB-C / Thunderbolt docks and hubs on Linux.**
 
-Docks ship their network chips in a generic plug-and-play mode that hides most of what
-the hardware can do — and on Linux, no vendor gives you a tool to change that. DockPilot
-detects the dock's chipset and, **where the hardware allows**, safely and reversibly
-unlocks the manufacturer's native mode (Wake-on-LAN, link tuning, EEPROM inspection),
-draws a live map of the dock's internals, and controls its USB devices and audio.
-
-Where a dock can do something, it unlocks it. Where a dock *can't*, it says so clearly and puts you back on a working configuration.
+Docks hide most of what their hardware can actually do, and on Linux no vendor gives you a tool
+to change that. DockPilot works out what's inside your dock, unlocks what it safely can, shows you
+what's really going on, and lets you control it.
 
 ![DockPilot dashboard](screenshots/01-dashboard.png)
 
@@ -27,38 +23,24 @@ Where a dock can do something, it unlocks it. Where a dock *can't*, it says so c
 
 ## What it does
 
-- **Native-mode unlock (reversible).** Detects ASIX / Realtek dock NICs and, if they're in
-  a limited plug-and-play (CDC) mode, offers a one-click switch to the native driver —
-  then verifies the link actually comes up. If it does, native-only features appear. If it
-  doesn't, it auto-reverts to the working mode and tells you why.
-- **Wake-on-LAN.** Arm the dock NIC to wake the machine over the wired link, and send magic
-  packets to wake your other machines (pure Python, no external tool).
-- **Live dashboard.** Real-time throughput graph, link health (error/drop counters),
-  reachability (gateway / internet / DNS latency, public IP, LAN device count), and the
-  dock's chip identity — all from `/sys` and `ethtool`.
-- **USB topology map.** A live diagram of the dock as a device: its hubs, every downstream
-  port, and what occupies each — scoped strictly to the dock (your laptop's own ports are
-  excluded). Falls back gracefully on hubs with no NIC.
-- **Per-device USB control.** Enable/disable individual devices behind the dock; per-port
-  power via `uhubctl` where the hub supports it.
-- **Link & offload tuning** (native mode): force speed/duplex, renegotiate, toggle NIC
-  offloads — each with a plain-language explanation of what it actually does.
-- **EEPROM inspection.** Read-only: reports whether the NIC has a rewritable EEPROM or uses
-  one-time eFuse, and can back it up. Never writes.
-- **Connect/disconnect automation.** Rules that fire when the dock link goes up/down
-  (e.g. turn Wi-Fi off when wired, MAC pass-through), persisted across restarts.
-
-## What it does **not** do
-
-- It does not talk to HDMI/DisplayPort video or Power Delivery — those aren't on the USB
-  data bus and no USB tool can see them (it labels them).
-- It cannot make a dock do something its silicon can't. Some chips (see below) engage
-  native mode but their wired link never comes up — DockPilot diagnoses that and reverts,
-  it does not "fix" the hardware.
-- It writes nothing to any EEPROM/eFuse. Inspection only.
-- Linux only. Uses NetworkManager for some conveniences (degrades gracefully without it).
-
----
+- **Unlocks hidden features.** Many dock network chips ship in a limited plug-and-play mode.
+  DockPilot detects this and offers a one-click, reversible switch to the manufacturer's native
+  driver — then checks it actually worked, and puts things back if it didn't.
+- **Wake-on-LAN.** Wake your machine over the dock's wired link, and send magic packets to wake
+  other machines on your network.
+- **Live dashboard.** Throughput, link health, latency, and what chip your dock actually contains.
+- **Dock map.** A live diagram of the dock's internals — its hubs, ports, and what's plugged into
+  each — scoped to the dock, not your laptop.
+- **Per-device control.** Enable or disable individual devices behind the dock; switch port power
+  where the hardware supports it.
+- **Macros.** Run your own commands when the dock connects or disconnects. No assumptions about
+  your setup — you write the commands; five editable templates get you started, and macros can be
+  scoped to a specific dock.
+- **System Snapshot.** One button writes a single diagnostic file (chips, drivers, USB layout, link
+  stats, logs) with IPs and hostname redacted — ready to attach to a bug report.
+- **Automation.** Turn Wi-Fi off when you dock, mirror your laptop's MAC, switch audio to the dock.
+- **Tidy-up tools.** Clean up leftover network profiles, inspect chip configuration (read-only),
+  and tune link speed and offloads where the hardware allows.
 
 ## Tested hardware
 
@@ -74,19 +56,8 @@ Every device below was tested on a real machine.
 | TP-Link UE302C (2.5G) | Realtek **RTL8156** | `r8152` | ✅ already native; advertises 2500baseT/Full |
 | MOKiN / C-Smartlink DK1903A (Thunderbolt 4, 12-in-1) | Realtek **RTL8156B** | `r8152` | ✅ already native; works fully over Thunderbolt |
 | ASIX AX88772B USB-A adapter (10/100) | ASIX **AX88772B** | `asix` | ✅ single USB config — nothing to unlock; correctly offers no native mode |
+| Belkin USB-C to 2.5GbE (USB-IF certified) | Realtek **RTL8156B** | `r8152` | ✅ already native; **links at a real 2500 Mb/s** |
 | Lemorele 10-in-1 | *(no NIC)* | — | ✅ graceful: "no network chip", topology still drawn |
-
-### The key finding
-
-- **Realtek (RTL8153 / RTL8156)** native mode works — the chips ship on the native `r8152`
-  driver and link cleanly, gigabit and 2.5G alike.
-- **Current-generation ASIX (AX88179B)** native mode is **broken on current Linux**: the
-  native `ax88179_178a` driver binds, but the Ethernet PHY never links (`carrier` stays
-  down). Only the older **AX88179A** links correctly.
-
-DockPilot handles both: it unlocks the chips that work, and for the ones that don't, it
-engages native mode, detects the dead link, reverts to the working standard mode, and
-explains why — remembering the verdict per-dock so it won't retry blindly.
 
 ---
 
@@ -136,16 +107,20 @@ and **no personal data ships with the project**:
 
 Detail for people who want it — skip unless you're digging in.
 
+**ASIX vs Realtek.** Realtek chips (RTL8153 / RTL8156) run their native driver happily — they
+usually arrive that way already. Current-generation **ASIX AX88179B** parts are a different story:
+the native driver binds, but the Ethernet link never comes up. Only the older **AX88179A** works.
+Four devices from three brands reproduce this here, and it's independently reported on the Linux
+kernel mailing list ("ax88179_178a … Link status is: 0"). DockPilot unlocks the chips that work and,
+for the ones that don't, engages native mode, spots the dead link, reverts, and remembers the
+verdict so it won't retry blindly.
+
 **How native-mode unlock works.** USB devices can present multiple *configurations*. Many
 ASIX/Realtek dock NICs ship on a generic CDC config (driven by `cdc_ncm`/`cdc_ether`), which
 hides the chip's advanced features. Their native/vendor config exposes everything, driven by
 `ax88179_178a` (ASIX) or `r8152` (Realtek). DockPilot switches by writing the device's
 `bConfigurationValue` in sysfs, then re-checks the driver and link, and reverts if the link
 doesn't come up. Fully reversible — unplugging the dock always returns it to standard mode.
-
-**The AX88179B problem is upstream, not ours.** It's independently reported on the Linux
-kernel mailing list ("ax88179_178a … Link status is: 0"). Four devices from three brands
-reproduce it here.
 
 **`r8152-cfgselector`.** Recent kernels ship a helper that performs the same
 `bConfigurationValue` switch for Realtek NICs automatically at plug-in. So modern Realtek
@@ -158,11 +133,11 @@ handling needed. It's also the only dock tested where `fwupd` sees dock-side fir
 USB3.0 Hub, USB4 Retimer); cheap USB-C docks show nothing. It needs a genuine Thunderbolt
 cable — a normal USB-C cable silently drops it to USB 2.0 with no error.
 
-**2.5G links.** An RTL8156 advertises 2500baseT/Full but only *links* at 2.5G if the other
-end is also 2.5G; on gigabit infrastructure it negotiates to 1000Mb/s. DockPilot reports
-advertised modes and negotiated speed separately. On one dock `ethtool` misreported the
-advertised modes (claiming 10baseT on a 2.5G chip) while sysfs correctly showed 1000 —
-worth knowing that advertised-modes output isn't always trustworthy.
+**2.5G links.** An RTL8156 only *links* at 2.5G if the other end is 2.5G too; on gigabit
+infrastructure it negotiates down to 1000Mb/s. The Belkin adapter confirmed a real 2500Mb/s link.
+Note that `ethtool`'s advertised-modes output isn't always trustworthy — one dock claimed
+10baseT-only on a 2.5G chip while sysfs correctly reported the real speed, so DockPilot reads
+speed from sysfs.
 
 **EEPROM in practice.** Across nine devices, only one exposes a readable EEPROM: the older ASIX
 **AX88772B**, where the layout is fully decodable — MAC at `0x0008`, VID/PID at `0x0048`, vendor
