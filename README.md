@@ -57,6 +57,8 @@ Every device below was tested on a real machine.
 | MOKiN / C-Smartlink DK1903A (Thunderbolt 4, 12-in-1) | Realtek **RTL8156B** | `r8152` | ✅ already native; works fully over Thunderbolt |
 | ASIX AX88772B USB-A adapter (10/100) | ASIX **AX88772B** | `asix` | ✅ single USB config — nothing to unlock; correctly offers no native mode |
 | Belkin USB-C to 2.5GbE (USB-IF certified) | Realtek **RTL8156B** | `r8152` | ✅ already native; **links at a real 2500 Mb/s** |
+| Luonanava 8-in-1 USB-C Hub | Realtek **RTL8152** (10/100) | `r8152` | ✅ already native; whole tree runs at USB 2.0, links at 100 Mb/s |
+| LINOVISION PoE→USB-C Converter | Realtek **RTL8152** (10/100) | `r8152` | ✅ already native; single device, no hub — simplest topology tested |
 | Lemorele 10-in-1 | *(no NIC)* | — | ✅ graceful: "no network chip", topology still drawn |
 
 ---
@@ -107,8 +109,8 @@ and **no personal data ships with the project**:
 
 Detail for people who want it — skip unless you're digging in.
 
-**ASIX vs Realtek.** Realtek chips (RTL8153 / RTL8156) run their native driver happily — they
-usually arrive that way already. Current-generation **ASIX AX88179B** parts are a different story:
+**ASIX vs Realtek.** The whole Realtek ladder — **RTL8152** (10/100), **RTL8153** (gigabit) and
+**RTL8156/8156B** (2.5G) — runs its native driver happily, and they usually arrive that way already. Current-generation **ASIX AX88179B** parts are a different story:
 the native driver binds, but the Ethernet link never comes up. Only the older **AX88179A** works.
 Four devices from three brands reproduce this here, and it's independently reported on the Linux
 kernel mailing list ("ax88179_178a … Link status is: 0"). DockPilot unlocks the chips that work and,
