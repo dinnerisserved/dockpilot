@@ -39,10 +39,18 @@ try:
 except ImportError:
     raise SystemExit("Missing dependency — run:  pip install customtkinter")
 
+try:
+    import opendock                    # docks that speak the DockPilot Dock Protocol (OpenDock firmware)
+except ImportError:                    # opendock.py lives beside this file; without it the page just explains
+    try:
+        from . import opendock         # installed from pip, where this file is dockpilot_pkg/app.py
+    except ImportError:
+        opendock = None
+
 # --------------------------------------------------------------------------- #
 #  config — beside the script only
 # --------------------------------------------------------------------------- #
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.4.0"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def _pick_config_dir():
@@ -185,6 +193,17 @@ def read_sys(path):
     except Exception:
         return ""
 
+def _hms(seconds):
+    """3605 -> '1h 0m 5s'."""
+    try:
+        s = int(seconds)
+    except Exception:
+        return "?"
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return ("%dh %dm %ds" % (h, m, s)) if h else ("%dm %ds" % (m, s)) if m else ("%ds" % s)
+
+
 def human(n):
     n = float(n)
     for u in ["B", "KB", "MB", "GB", "TB"]:
@@ -255,9 +274,144 @@ def net_state(name):  return read_sys(f"/sys/class/net/{name}/operstate") or "?"
 def net_carrier(name): return read_sys(f"/sys/class/net/{name}/carrier") == "1"
 
 # ---- native-mode detection + tuning (ASIX / Realtek) ----
-NIC_VENDORS = {"0b95": "ASIX", "0bda": "Realtek", "0b95": "ASIX"}
+NIC_VENDORS = {"0b95": "ASIX", "0bda": "Realtek"}
 NATIVE_DRIVERS = {"ax88179_178a", "ax88179a", "r8152", "r8153"}
-CDC_DRIVERS = {"cdc_ncm", "cdc_ether", "cdc_eem", "cdc_mbim"}
+CDC_DRIVERS = {"cdc_ncm", "cdc_ether", "cdc_eem", "cdc_mbim", "r8153_ecm"}   # r8153_ecm: Realtek's own ECM stand-in
+
+# --------------------------------------------------------------------------- #
+#  Realtek identification — everything below comes from Realtek's own r8152
+#  driver source (v2.22.1, 2026): its USB device table, its named dock IDs,
+#  its chip-version list and its MAC pass-through rules. Nothing here needs
+#  that driver installed; it is knowledge, not code, and it lets DockPilot
+#  name what it sees where the kernel only shows a vendor id.
+# --------------------------------------------------------------------------- #
+# Realtek NICs sold under other USB vendor ids (they still switch to r8152 the same way)
+REALTEK_REBRANDS = {
+    ("045e", "07ab"), ("045e", "07c6"), ("045e", "0927"), ("045e", "0c5e"),        # Microsoft
+    ("04e8", "a101"),                                                               # Samsung
+    ("17ef", "304f"), ("17ef", "3052"), ("17ef", "3054"), ("17ef", "3057"),        # Lenovo
+    ("17ef", "3062"), ("17ef", "3069"), ("17ef", "3082"), ("17ef", "3098"),
+    ("17ef", "7205"), ("17ef", "720a"), ("17ef", "720b"), ("17ef", "720c"),
+    ("17ef", "7214"), ("17ef", "721e"), ("17ef", "8153"), ("17ef", "a359"), ("17ef", "a387"),
+    ("13b1", "0041"),                                                               # Linksys
+    ("0955", "09ff"),                                                               # Nvidia
+    ("2357", "0601"),                                                               # TP-Link
+    ("0b05", "1976"), ("0b05", "1d91"),                                             # ASUS
+    ("2baf", "0012"),
+}
+# What a Realtek product id says by itself (the exact part comes from the firmware name, below)
+REALTEK_PIDS = {
+    "8152": "RTL8152 (10/100)", "8153": "RTL8153 (gigabit)",
+    "8156": "RTL8156 (2.5 GbE)", "8157": "RTL8157 (5 GbE)",
+    # generic ids Realtek uses for several parts (8053 with a hardware rev of e0.xx is the
+    # three-configuration layout: NCM, ECM, then vendor mode as #3)
+    "8050": "Realtek USB Ethernet (product id 8050)", "8053": "Realtek USB Ethernet (product id 8053)",
+    "8155": "Realtek USB Ethernet (product id 8155)", "815a": "Realtek USB Ethernet (product id 815a)",
+}
+REBRAND_VENDORS = {"045e": "Microsoft", "04e8": "Samsung", "17ef": "Lenovo", "13b1": "Linksys",
+                   "0955": "Nvidia", "2357": "TP-Link", "0b05": "ASUS"}
+# Chip version codes the Realtek driver reads from the silicon, and what they are.
+# The kernel's own r8152 names its firmware files after these ("rtl8153a-3", "rtl8156b-2"),
+# so the file it loads — visible in `ethtool -i` and the kernel log — tells the exact variant.
+REALTEK_VARIANTS = {
+    "rtl8152b": "RTL8152B (10/100)", "rtl8153a": "RTL8153A (gigabit)", "rtl8153b": "RTL8153B (gigabit)",
+    "rtl8153c": "RTL8153C (gigabit)", "rtl8156a": "RTL8156A (2.5 GbE)", "rtl8156b": "RTL8156B (2.5 GbE)",
+    "rtl8157": "RTL8157 (5 GbE)", "rtl8159": "RTL8159 (10 GbE)",
+}
+# Docks Realtek's driver names outright, and the ones it knows carry the host's own MAC
+# through from BIOS (Lenovo via ACPI \MACA; Dell docks do the same via \_SB.AMAC on
+# RTL8153-AD/-BD/-BND silicon, which only the driver can tell apart).
+DOCK_NAMES = {
+    ("17ef", "3054"): "ThinkPad OneLink+ Dock", ("17ef", "3082"): "ThinkPad Thunderbolt 3 Dock Gen 2",
+    ("17ef", "a387"): "ThinkPad USB-C Dock Gen 2", ("17ef", "3062"): "ThinkPad USB-C Dock Gen 3",
+    ("17ef", "721e"): "Lenovo USB-C Travel Hub", ("17ef", "720c"): "ThinkPad USB-C dongle",
+}
+MAC_PASSTHRU_DOCKS = set(DOCK_NAMES)
+USB_CLASS_NAMES = {0x02: "CDC (standard)", 0x0a: "CDC data", 0xff: "vendor (native)", 0x09: "hub", 0xe0: "wireless"}
+
+
+def usb_configs(name):
+    """Every USB configuration the device offers, from its raw descriptors in sysfs:
+    [{"value": "1", "class": 0xff, "kind": "vendor (native)", "ifaces": 1}, ...].
+    Realtek's driver finds native mode by class, not by number — "the vendor mode is
+    not always config #1" — so DockPilot does the same."""
+    try:
+        with open(os.path.join(USB_ROOT, name, "descriptors"), "rb") as f:
+            d = f.read()
+    except Exception:
+        return []
+    out, i, cur = [], 0, None
+    while i + 2 <= len(d):
+        ln, typ = d[i], d[i + 1]
+        if ln < 2:
+            break
+        if typ == 0x02 and ln >= 9:                       # configuration descriptor
+            cur = {"value": str(d[i + 5]), "class": None, "kind": "?", "ifaces": d[i + 4]}
+            out.append(cur)
+        elif typ == 0x04 and ln >= 9 and cur is not None and cur["class"] is None and d[i + 3] == 0:
+            cur["class"] = d[i + 5]                       # first interface's class
+            cur["kind"] = USB_CLASS_NAMES.get(d[i + 5], "class 0x%02x" % d[i + 5])
+        i += ln
+    return out
+
+
+def realtek_identity(vid, pid, driver="", fw_version="", parent_vid=""):
+    """Name a Realtek NIC as precisely as what we can see allows.
+    name: the best name we have (exact part if the firmware name told us, else the product id's)
+    variant: the exact part from the firmware name, "" if unknown
+    sold_as: "Lenovo" etc. for Realtek silicon behind another vendor's USB id, "" for 0bda
+    dock: the dock Realtek's driver names for this id, "" otherwise
+    mac_passthru: True if Realtek's driver would take the laptop's BIOS MAC for this dock"""
+    if vid != "0bda" and (vid, pid) not in REALTEK_REBRANDS:
+        return None
+    sold_as = "" if vid == "0bda" else REBRAND_VENDORS.get(vid, "another vendor")
+    variant = ""
+    m = re.match(r"(rtl81\d\d[a-z]?)(?:-(\d+))?", fw_version or "")
+    if m:
+        variant = REALTEK_VARIANTS.get(m.group(1), m.group(1).upper())
+        if m.group(2):
+            variant += ", silicon rev %s" % m.group(2)
+    if variant:
+        name = variant
+    elif sold_as:
+        name = "Realtek silicon (exact part unknown)"
+    else:
+        name = REALTEK_PIDS.get(pid, "Realtek USB Ethernet (product id %s)" % pid)
+    passthru = (vid, pid) in MAC_PASSTHRU_DOCKS or (vid == "0bda" and pid == "8153" and parent_vid == "17ef")
+    return {"name": name, "variant": variant, "sold_as": sold_as,
+            "dock": DOCK_NAMES.get((vid, pid), ""), "mac_passthru": passthru}
+
+
+def ethtool_info(iface):
+    """driver / version / firmware-version / bus-info from `ethtool -i`, or {}."""
+    if not have("ethtool") or not iface:
+        return {}
+    rc, out = run(["ethtool", "-i", iface], timeout=5)
+    info = {}
+    for line in out.splitlines():
+        if ":" in line:
+            k, v = line.split(":", 1)
+            info[k.strip()] = v.strip()
+    return info
+
+
+def kernel_log_firmware(iface):
+    """The firmware file the kernel's r8152 loaded for this NIC, from the kernel log
+    (e.g. "rtl8156b-2"). Empty if the log isn't readable or nothing was loaded."""
+    for cmd in (["journalctl", "-k", "--no-pager", "-o", "cat", "-n", "4000"], ["dmesg"]):
+        if not have(cmd[0]):
+            continue
+        rc, out = run(cmd, timeout=8)
+        if rc != 0:
+            continue
+        found = ""
+        for line in out.splitlines():
+            if "r8152" in line and "rtl_nic/" in line:
+                m = re.search(r"rtl_nic/(rtl81\w+(?:-\d+)?)\.fw", line)
+                if m:
+                    found = m.group(1)                    # keep the last one seen
+        return found
+    return ""
 
 def nic_chip(iface):
     """Identify the dock NIC's chip vendor, driver, and USB config state."""
@@ -268,11 +422,20 @@ def nic_chip(iface):
         return None
     info = usb_info(name)
     vendor = NIC_VENDORS.get(info["vid"])
+    if not vendor and (info["vid"], info["pid"]) in REALTEK_REBRANDS:
+        vendor = "Realtek"
+    configs = usb_configs(name)
+    vendor_cfg = next((c["value"] for c in configs if c["class"] == 0xff), "")
+    cdc_cfg = next((c["value"] for c in configs if c["class"] == 0x02), "")
+    parent = os.path.basename(os.path.dirname(os.path.realpath(os.path.join(USB_ROOT, name))))
+    parent_vid = _u(os.path.join(USB_ROOT, parent), "idVendor") if parent else ""
     return {
         "usb": name, "vid": info["vid"], "pid": info["pid"], "vendor": vendor,
-        "product": info["product"] or "",
+        "product": info["product"] or "", "bcd": info["bcd"] or "",
         "nconfigs": int(read_sys(os.path.join(USB_ROOT, name, "bNumConfigurations") or "1") or 1),
         "config": read_sys(os.path.join(USB_ROOT, name, "bConfigurationValue")),
+        "configs": configs, "vendor_config": vendor_cfg, "cdc_config": cdc_cfg,
+        "parent_vid": parent_vid,
         "driver": net_driver(iface),
     }
 
@@ -283,7 +446,7 @@ def native_state(iface):
         return "unsupported", c
     if c["driver"] in NATIVE_DRIVERS:
         return "native", c
-    if c["driver"] in CDC_DRIVERS and c["nconfigs"] > 1:
+    if c["driver"] in CDC_DRIVERS and c["nconfigs"] > 1 and (c["vendor_config"] or not c["configs"]):
         return "unlockable", c
     return "unsupported", c
 
@@ -648,7 +811,8 @@ class DockPilot(ctk.CTk):
         self.top_hub = dock_top_hub(dock_nic_usb_name(self.iface)) if self.iface else ""
         self.orig_mac = original_mac(self.iface, net_mac(self.iface)) if self.iface else ""
         _c0 = nic_chip(self.iface) if self.iface else None
-        self.standard_config = (_c0["config"] if _c0 and _c0["driver"] in CDC_DRIVERS and _c0["config"] else "2")
+        self.standard_config = (_c0["config"] if _c0 and _c0["driver"] in CDC_DRIVERS and _c0["config"]
+                                else (_c0["cdc_config"] if _c0 and _c0.get("cdc_config") else "2"))
         self.rx_hist = collections.deque(maxlen=120)
         self.tx_hist = collections.deque(maxlen=120)
         self._last_bytes = net_bytes(self.iface) if self.iface else (0, 0)
@@ -657,6 +821,9 @@ class DockPilot(ctk.CTk):
         self.log_lines = []
         self.macro_store = MacroStore()
         self.privshell = PrivShell()
+        self.odlink = None                 # a DockPilot-protocol dock, if one turns up
+        self._od_snap = {}
+        self._start_opendock()
 
         auto = load_json(AUTOMATION_FILE, {})
         self.rule_wifi = tk.BooleanVar(value=bool(auto.get("wifi", False)))
@@ -679,6 +846,209 @@ class DockPilot(ctk.CTk):
         self.show("Dashboard")
         self._tick()
 
+    # ---------- OpenDock (DockPilot-protocol docks) ----------
+    def _start_opendock(self):
+        """Watch for a dock that speaks the protocol, on its own thread. The GUI only
+        ever reads link.snapshot(); every callback is marshalled onto the Tk thread."""
+        if opendock is None or opendock.serial is None:
+            return
+        self.odlink = opendock.DockLink(
+            CONFIG_DIR,
+            on_connect=lambda l: self.after(0, self._od_connected),
+            on_disconnect=lambda l: self.after(0, self._od_disconnected),
+            on_event=lambda t: self.after(0, lambda: self._od_event(t)),
+            on_log=lambda es: self.after(0, lambda: self._od_new_log(es)))
+
+        def worker():
+            while True:
+                try:
+                    self.odlink.poll()
+                except Exception as e:           # never let the watcher die
+                    self.odlink.error = str(e)
+                self._od_snap = self.odlink.snapshot()
+                time.sleep(2.0)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _od_env(self):
+        snap = self._od_snap
+        ident, st = snap.get("identity") or {}, snap.get("status") or {}
+        return {"DOCK_UID": ident.get("uid", ""), "DOCK_SERIAL": ident.get("serial", ""),
+                "DOCK_MODEL": ident.get("model", ""), "DOCK_FW": ident.get("fw", ""),
+                "DOCK_PORT": snap.get("port") or "", "DOCK_NAME": st.get("name", ""),
+                "DOCK_ASSETTAG": st.get("assettag", ""), "DOCK_SITE": st.get("site", "")}
+
+    def _od_connected(self):
+        self._od_snap = self.odlink.snapshot()
+        i = self._od_snap.get("identity") or {}
+        self.log("# OpenDock %s (%s, fw %s) on %s" % (i.get("serial"), i.get("model"), i.get("fw"), self._od_snap.get("port")))
+        n = run_macros(self.macro_store, "opendock_connect", log=self.log, dock_model=i.get("model", ""), **self._od_env())
+        if n:
+            self.log("# %d macro(s) fired" % n)
+        if self.current == "OpenDock":
+            self.show("OpenDock")
+
+    def _od_disconnected(self):
+        env = self._od_env()
+        self._od_snap = self.odlink.snapshot()
+        self.log("# OpenDock gone (%s)" % (self._od_snap.get("error") or "unplugged"))
+        run_macros(self.macro_store, "opendock_disconnect", log=self.log, dock_model=env.get("DOCK_MODEL", ""), **env)
+        if self.current == "OpenDock":
+            self.show("OpenDock")
+
+    def _od_event(self, text):
+        self.log("# OpenDock event: %s" % text)
+
+    def _od_new_log(self, entries):
+        self._od_snap = self.odlink.snapshot()
+        for e in entries[-5:]:
+            self.log("# OpenDock log: " + opendock.describe(e))
+        if len(entries) > 5:
+            self.log("# OpenDock log: … %d entries in all" % len(entries))
+        self._od_refresh_log()
+
+    def _od_status_text(self):
+        snap = self._od_snap
+        if not snap.get("connected"):
+            why = snap.get("error") or "Plug one in — it is found within a few seconds."
+            if why.startswith("no reply") or why.startswith("port write failed"):
+                why = "The dock stopped answering — unplugged? It is picked up again within a few seconds."
+            return "No OpenDock found.\n" + why
+        i, s = snap.get("identity") or {}, snap.get("status") or {}
+        synced = "synced" if s.get("time_synced") else "not synced (SET TIME pending)"
+        docked = "yes, for %s" % _hms(s.get("docked_s", 0)) if s.get("docked") else "no"
+        lines = [f"Serial:        {i.get('serial')}      chip id {i.get('uid')}",
+                 f"Model:         {i.get('model')}   firmware {i.get('fw')}   protocol v{i.get('proto')}   on {snap.get('port')}",
+                 f"Name:          {s.get('name') or '—'}",
+                 f"Asset tag:     {s.get('assettag') or '—'}",
+                 f"Site:          {s.get('site') or '—'}",
+                 f"Laptop docked: {docked}",
+                 f"Temperature:   {s.get('temp_c')} °C",
+                 f"Uptime:        {_hms(s.get('uptime_s', 0))}   clock {synced}",
+                 f"Log:           {s.get('log_entries')} entries on the dock (newest #{s.get('log_last')}), "
+                 f"{snap.get('log_count', 0)} kept here"]
+        if s.get("log_volatile"):
+            lines.append("⚠  log_volatile: the dock's dev jumper is fitted — settings cannot be written")
+        return "\n".join(lines)
+
+    def _page_opendock(self, w):
+        c = self._card(w, "OpenDock",
+                       "A dock with the management chip inside speaks a small open protocol over a USB serial "
+                       "port. It says what it is, keeps a few settings, and remembers what happened to it.")
+        if opendock is None:
+            ctk.CTkLabel(c, text="opendock.py is missing from the DockPilot folder.", justify="left",
+                         anchor="w").pack(anchor="w", padx=16, pady=(6, 14))
+            return
+        if opendock.serial is None:
+            ctk.CTkLabel(c, text="Needs pyserial:   pip install pyserial   (then restart DockPilot)",
+                         justify="left", anchor="w", font=ctk.CTkFont(family="monospace", size=13)
+                         ).pack(anchor="w", padx=16, pady=(6, 14))
+            return
+        self.od_lbl = ctk.CTkLabel(c, text=self._od_status_text(), justify="left", anchor="w",
+                                   font=ctk.CTkFont(family="monospace", size=13))
+        self.od_lbl.pack(anchor="w", padx=16, pady=(6, 14))
+        hint = dialout_hint()
+        if hint and not self._od_snap.get("connected"):
+            self._card(w, "Serial permission", hint)
+        if not self._od_snap.get("connected"):
+            return
+
+        st = self._od_snap.get("status") or {}
+        sc = self._card(w, "Settings",
+                        "Written into the dock's own flash; they survive power loss and travel with it. "
+                        "Up to 64 bytes each. The dock refuses to rewrite the same field more than once "
+                        "every 10 s — if it says wait, DockPilot waits.")
+        self.od_entries = {}
+        for key, label in (("name", "Name"), ("assettag", "Asset tag"), ("site", "Site")):
+            r = ctk.CTkFrame(sc, fg_color="transparent"); r.pack(fill="x", padx=16, pady=3)
+            ctk.CTkLabel(r, text=label, width=90, anchor="w").pack(side="left")
+            e = ctk.CTkEntry(r, width=360); e.insert(0, st.get(key, "")); e.pack(side="left", padx=8)
+            ctk.CTkButton(r, text="Save", width=80, command=lambda k=key: self._od_save(k)).pack(side="left")
+            self.od_entries[key] = e
+        ctk.CTkLabel(sc, text="", text_color=("gray55", "gray55")).pack(anchor="w", padx=16, pady=(0, 10))
+
+        lc = self._card(w, "Event log",
+                        "What the dock remembers: power-ups, laptops docking and undocking, temperature, "
+                        "settings changes. Collected by index, so nothing is fetched twice. "
+                        "\"Clear\" hides the dock's history; the copy kept here is cleared too.")
+        self.od_logbox = ctk.CTkTextbox(lc, font=ctk.CTkFont(family="monospace", size=12), height=260)
+        self.od_logbox.pack(fill="both", expand=True, padx=10, pady=(8, 4))
+        r = ctk.CTkFrame(lc, fg_color="transparent"); r.pack(fill="x", padx=16, pady=(0, 14))
+        ctk.CTkButton(r, text="Export JSON…", command=self._od_export).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(r, text="Clear dock log", fg_color="#8a3b3b", hover_color="#6a2b2b",
+                      command=self._od_clear).pack(side="left")
+        self._od_refresh_log()
+
+    def _od_refresh_log(self):
+        box = getattr(self, "od_logbox", None)
+        if box is None or not box.winfo_exists():
+            return
+        entries = self._od_snap.get("log") or []
+        box.delete("1.0", "end")
+        box.insert("end", "\n".join(opendock.describe(e) for e in entries[-200:]) or "(nothing yet)")
+        box.see("end")
+
+    def _od_save(self, key):
+        if not self.odlink or not self.odlink.connected:
+            return
+        value = self.od_entries[key].get()
+        why = opendock.validate_setting(value)
+        if why:
+            self.log("# OpenDock %s not saved: %s" % (key, why)); return
+        self.log("# OpenDock: set %s" % key)
+
+        def worker():
+            try:
+                self.odlink.set(key, value)
+                msg = "# OpenDock %s saved" % key
+            except opendock.DockBusy as e:
+                msg = "# OpenDock %s not saved — dock busy: %s" % (key, e)
+            except opendock.DockError as e:
+                msg = "# OpenDock %s not saved: %s" % (key, e)
+            self._od_snap = self.odlink.snapshot()
+            self.after(0, lambda: (self.log(msg), self._od_refresh_status()))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _od_clear(self):
+        if not self.odlink or not self.odlink.connected:
+            return
+        if not messagebox.askyesno("Clear dock log", "Hide everything the dock has logged so far?\n\n"
+                                   "The dock keeps counting from where it was; the copy kept by DockPilot "
+                                   "is cleared as well."):
+            return
+
+        def worker():
+            try:
+                self.odlink.clear_log()
+                msg = "# OpenDock log cleared"
+            except opendock.DockError as e:
+                msg = "# OpenDock log not cleared: %s" % e
+            self._od_snap = self.odlink.snapshot()
+            self.after(0, lambda: (self.log(msg), self._od_refresh_status(), self._od_refresh_log()))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _od_export(self):
+        snap = self._od_snap
+        if not snap.get("connected") or not self.odlink.store:
+            return
+        serial_no = (snap.get("identity") or {}).get("serial", "dock")
+        path = os.path.join(os.path.expanduser("~"), "opendock-log-%s-%s.json" % (serial_no, time.strftime("%Y%m%d-%H%M%S")))
+        try:
+            with open(path, "w") as f:
+                json.dump({"identity": snap.get("identity"), "status": snap.get("status"),
+                           "entries": self.odlink.store.entries}, f, indent=1)
+            self.log("# OpenDock log exported: %s" % path)
+        except Exception as e:
+            self.log("# OpenDock export failed: %s" % e)
+
+    def _od_refresh_status(self):
+        lbl = getattr(self, "od_lbl", None)
+        if lbl is not None and lbl.winfo_exists():
+            lbl.configure(text=self._od_status_text())
+        dot = getattr(self, "ss_od", None)
+        if dot is not None:
+            i = self._od_snap.get("identity") or {}
+            dot.configure(text=("⛁ %s" % i.get("serial")) if self._od_snap.get("connected") else "")
+
     # ---------- status strip ----------
     def _build_statusstrip(self):
         s = ctk.CTkFrame(self, corner_radius=0, height=54, fg_color=("#0e1116", "#0e1116"))
@@ -687,13 +1057,16 @@ class DockPilot(ctk.CTk):
         self.ss_dot = ctk.CTkLabel(s, text="●", font=ctk.CTkFont(size=20)); self.ss_dot.pack(side="left", padx=(12, 4))
         self.ss_iface = ctk.CTkLabel(s, text="no dock NIC", font=ctk.CTkFont(size=13, weight="bold")); self.ss_iface.pack(side="left")
         self.ss_speed = ctk.CTkLabel(s, text="", text_color=("gray60", "gray60")); self.ss_speed.pack(side="left", padx=12)
+        self.ss_od = ctk.CTkLabel(s, text="", text_color=(ACCENT, ACCENT), font=ctk.CTkFont(size=13, weight="bold"))
+        self.ss_od.pack(side="right", padx=14)
+        tip(self.ss_od, "An OpenDock (DockPilot-protocol dock) is connected")
 
     # ---------- sidebar ----------
     def _build_sidebar(self):
         bar = ctk.CTkFrame(self, width=176, corner_radius=0, fg_color=("#0e1116", "#0e1116"))
         bar.grid(row=1, column=0, sticky="nsw"); bar.grid_propagate(False)
         self.nav_buttons = {}
-        for name in ("Dashboard", "Identity", "Native Mode", "Network", "USB & Power",
+        for name in ("Dashboard", "Identity", "OpenDock", "Native Mode", "Network", "USB & Power",
                      "Topology", "Audio", "Automation", "Macros", "Logs"):
             b = ctk.CTkButton(bar, text=name, anchor="w", corner_radius=8, height=38,
                               fg_color="transparent", hover_color=("#1b2027", "#1b2027"),
@@ -716,7 +1089,7 @@ class DockPilot(ctk.CTk):
         wrap.grid_columnconfigure(0, weight=1)
         {
             "Dashboard": self._page_dashboard, "Identity": self._page_identity,
-            "Native Mode": self._page_native,
+            "OpenDock": self._page_opendock, "Native Mode": self._page_native,
             "Network": self._page_network, "USB & Power": self._page_usb,
             "Topology": self._page_topology, "Audio": self._page_audio,
             "Automation": self._page_automation, "Macros": self._page_macros,
@@ -743,12 +1116,64 @@ class DockPilot(ctk.CTk):
             rev = f"v{int(raw[:2])}.{raw[2:]}" if re.fullmatch(r"[0-9a-f]{4}", raw) else raw
         mode = nic_mode(ifc)
         lines = [f"Dock NIC:      {ifc}   ({net_driver(ifc)})",
-                 f"Current MAC:   {net_mac(ifc)}",
+                 f"Current MAC:   {net_mac(ifc)}   {self._mac_origin()}",
                  f"Original MAC:  {self.orig_mac or 'unknown'}",
                  f"Link:          {net_speed(ifc)}   ·   carrier {'up' if net_carrier(ifc) else 'down'}",
                  f"Dock hub rev:  {rev or '—'}   (from USB descriptor)"]
         if mode:
             lines.append(f"NIC mode:      {mode}")
+        return "\n".join(lines)
+
+    def _mac_origin(self):
+        """Where the dock NIC's current MAC came from, as far as we can see."""
+        ifc = self.iface
+        if not ifc:
+            return ""
+        cur = net_mac(ifc)
+        host = {net_mac(n) for n in list_ifaces() if n != ifc and not iface_is_usb(n)}
+        if cur in host:
+            if self.orig_mac and self.orig_mac == cur:
+                return "(same as this laptop's own NIC — firmware MAC pass-through)"
+            return "(mirrored from this laptop's NIC by DockPilot)"
+        if self.orig_mac and cur != self.orig_mac:
+            return "(changed by DockPilot; original below)"
+        return "(the dock's own)"
+
+    def _chip_text(self):
+        """Everything we can tell about the network chip without touching it."""
+        c = nic_chip(self.iface) if self.iface else None
+        if not c:
+            return "No USB-Ethernet NIC found — this hub has no network chip."
+        info = ethtool_info(self.iface)
+        fw = info.get("firmware-version", "") or kernel_log_firmware(self.iface)
+        rt = realtek_identity(c["vid"], c["pid"], c["driver"], fw, c["parent_vid"])
+        bcd = c["bcd"]
+        rev = f"{bcd[:2]}.{bcd[2:]}" if re.fullmatch(r"[0-9a-fA-F]{4}", bcd or "") else (bcd or "—")   # lsusb style: 30.00, e0.00
+        if rt:
+            chip = rt["name"]
+            if rt["sold_as"]:
+                chip += f"   — sold under {rt['sold_as']}'s USB id"
+            elif not rt["variant"]:
+                chip += "   (from the product id; the exact part shows once the r8152 driver names its firmware)"
+        elif c["vendor"] == "ASIX":
+            chip = "ASIX " + (c["product"] or "USB Ethernet")
+        else:
+            chip = c["product"] or "unknown"
+        lines = [f"Chip:          {chip}",
+                 f"USB id:        {c['vid']}:{c['pid']}   hardware rev {rev}   ({c['product'] or '—'})"]
+        if rt and rt["dock"]:
+            lines.append(f"Dock:          {rt['dock']}   (named in Realtek's own driver)")
+        if c["configs"]:
+            cfgs = "   ".join(f"#{x['value']} {x['kind']}{' ◀' if x['value'] == c['config'] else ''}" for x in c["configs"])
+            lines.append(f"USB configs:   {cfgs}")
+        drv = c["driver"] or "none"
+        if info.get("version"):
+            v = info["version"]
+            drv += " " + (v if v[:1] in "vV" else "v" + v)   # Realtek's own driver already says "v1.12.13"
+        lines.append(f"Driver:        {drv}" + (f"   firmware {fw}" if fw else ""))
+        if rt and rt["mac_passthru"]:
+            lines.append("MAC:           can carry the laptop's own MAC through from BIOS (pass-through)\n"
+                         "               — the Current MAC line above says whether it does")
         return "\n".join(lines)
 
     # ---------- Dashboard ----------
@@ -857,6 +1282,18 @@ class DockPilot(ctk.CTk):
         self.id_lbl = ctk.CTkLabel(c, text=self._identity_text(), justify="left", anchor="w",
                                    font=ctk.CTkFont(family="monospace", size=13))
         self.id_lbl.pack(anchor="w", padx=16, pady=(6, 14))
+        ch = self._card(w, "The chip",
+                        "What is actually inside, as precisely as the USB descriptors, the driver and the "
+                        "kernel log allow. Realtek parts are named from Realtek's own driver tables — "
+                        "including the ones sold under Lenovo, Microsoft, TP-Link and other vendor ids.")
+        self.chip_lbl = ctk.CTkLabel(ch, text="reading…", justify="left", anchor="w",
+                                     font=ctk.CTkFont(family="monospace", size=13))
+        self.chip_lbl.pack(anchor="w", padx=16, pady=(6, 14))
+
+        def worker():
+            text = self._chip_text()
+            self.after(0, lambda: self.chip_lbl.configure(text=text) if self.chip_lbl.winfo_exists() else None)
+        threading.Thread(target=worker, daemon=True).start()
         if not self.iface:
             return
         pt = self._card(w, "MAC pass-through",
@@ -1209,7 +1646,8 @@ class DockPilot(ctk.CTk):
     def _save_snapshot(self):
         try:
             path = write_snapshot(iface=self.iface, log_lines=self.log_lines,
-                                  dockpilot_version=APP_VERSION)
+                                  dockpilot_version=APP_VERSION,
+                                  od_snapshot=self.odlink.snapshot() if self.odlink else None)
             self.log("# snapshot written: %s" % path)
             messagebox.showinfo("System Snapshot",
                 "Diagnostic snapshot saved:\n\n%s\n\nIPs and hostname are redacted — safe to "
@@ -1298,10 +1736,12 @@ class DockPilot(ctk.CTk):
 
     def _native_hdr_text(self, state, c):
         carrier = "up" if net_carrier(self.iface) else "down"
+        native_cfg = c.get("vendor_config") or "?"
         return (f"Chip:    {c['vendor']}  {c['product'] or (c['vid']+':'+c['pid'])}\n"
                 f"Driver:  {c['driver']}\n"
                 f"USB cfg: {c['config']} of {c['nconfigs']}   "
-                f"({'NATIVE' if state == 'native' else 'standard mode'})   ·   link {carrier}")
+                f"({'NATIVE' if state == 'native' else 'standard mode'})   ·   native mode is config #{native_cfg}"
+                f"   ·   link {carrier}")
 
     def _native_poll(self):
         """While the Native Mode page is open, keep the header live and rebuild the page
@@ -1376,10 +1816,11 @@ class DockPilot(ctk.CTk):
                 "Give it a second and try again, or replug the dock.")
             return
         dev, drv, cfg = c["usb"], c["driver"], c["config"]
+        native = c["vendor_config"] or "1"                # found by interface class; "1" is the usual answer
         path = os.path.join(USB_ROOT, dev, "bConfigurationValue")
         script = (f"echo {dev}:{cfg}.0 > /sys/bus/usb/drivers/{drv}/unbind 2>/dev/null; "
-                  f"echo 1 > {path}")
-        self.do(priv(["bash", "-c", script]), note=f"unbind {drv} on {dev}, switch to native config (1)")
+                  f"echo {native} > {path}")
+        self.do(priv(["bash", "-c", script]), note=f"unbind {drv} on {dev}, switch to native config ({native})")
         self._set_status("Unlocking… switching to native mode.", ("#e0a13a", "#e0a13a"))
         self.after(2000, self._native_unlock_check)
 
@@ -1677,6 +2118,8 @@ class DockPilot(ctk.CTk):
         else:
             self.ss_dot.configure(text_color="#e05252")
             self.ss_iface.configure(text="no dock NIC")
+        if self.odlink is not None:
+            self._od_refresh_status()
         if self.current == "Dashboard":
             self._update_dashboard_fast()
             if not hasattr(self, "_sc"):
@@ -1695,7 +2138,7 @@ class DockPilot(ctk.CTk):
 # =========================================================================== #
 MACROS_FILE = os.path.join(CONFIG_DIR, "macros.json")
 
-TRIGGERS = ["connect", "disconnect", "port_on", "port_off"]
+TRIGGERS = ["connect", "disconnect", "port_on", "port_off", "opendock_connect", "opendock_disconnect"]
 
 ACCENT = "#2fbf5f"
 AMBER = "#e0a13a"
@@ -2115,13 +2558,24 @@ def _net_stats(iface):
     return "\n".join(out)
 
 
-def _mcu_state():
-    """Placeholder: future DockPilot-protocol docks (an MCU running our firmware)
-    will report IDENTIFY / CAPS / STATUS here."""
-    return "[no DockPilot-protocol dock detected]"
+def _mcu_state(snap=None):
+    """IDENTIFY / CAPS / STATUS of a DockPilot-protocol dock (an MCU running the
+    OpenDock firmware), from the app's last poll, plus the tail of its log."""
+    if not snap or not snap.get("connected"):
+        why = (snap or {}).get("error") or ""
+        return "[no DockPilot-protocol dock detected]" + (("\n" + why) if why else "")
+    ident, st = snap.get("identity") or {}, snap.get("status") or {}
+    lines = ["port:      %s" % snap.get("port"),
+             "identity:  %s" % json.dumps(ident, sort_keys=True),
+             "caps:      %s" % json.dumps(snap.get("caps") or {}, sort_keys=True),
+             "status:    %s" % json.dumps(st, sort_keys=True),
+             "log (last 20 of %d held here):" % snap.get("log_count", 0)]
+    if opendock is not None:
+        lines += ["  " + opendock.describe(e) for e in (snap.get("log") or [])[-20:]]
+    return "\n".join(lines)
 
 # --------------------------------------------------------------------------- #
-def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown"):
+def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown", od_snapshot=None):
     """Assemble the full diagnostic report as a string."""
     parts = []
     parts.append("DockPilot System Snapshot")
@@ -2145,6 +2599,20 @@ def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown"):
     # --- dock NIC ---
     parts.append(_section("DOCK NIC", "interface: %s" % (iface or "[none detected]")))
     if iface:
+        c = nic_chip(iface)
+        if c:
+            info = ethtool_info(iface)
+            fw = info.get("firmware-version", "") or kernel_log_firmware(iface)
+            rt = realtek_identity(c["vid"], c["pid"], c["driver"], fw, c["parent_vid"])
+            parts.append(_section("NIC CHIP", "\n".join([
+                "usb id:    %s:%s  rev %s  product %r" % (c["vid"], c["pid"], c["bcd"], c["product"]),
+                "vendor:    %s" % (c["vendor"] or "unknown"),
+                "realtek:   %s" % (json.dumps(rt) if rt else "n/a"),
+                "configs:   %s" % json.dumps(c["configs"]),
+                "active:    #%s   vendor cfg #%s   cdc cfg #%s   driver %s" % (
+                    c["config"], c["vendor_config"] or "?", c["cdc_config"] or "?", c["driver"]),
+                "firmware:  %s" % (fw or "[none reported]"),
+            ])))
         parts.append(_section("NIC DRIVER (ethtool -i)", _snap_snap_run(["ethtool", "-i", iface])))
         parts.append(_section("NIC LINK (ethtool)", _redact(_snap_snap_run(["ethtool", iface]))))
         parts.append(_section("NIC STATS (sysfs)", _net_stats(iface)))
@@ -2158,7 +2626,7 @@ def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown"):
     parts.append(_section("INTERFACES (ip -br addr)", _redact(_snap_snap_run(["ip", "-br", "addr"]))))
 
     # --- MCU / protocol dock ---
-    parts.append(_section("DOCKPILOT-PROTOCOL DOCK (MCU)", _mcu_state()))
+    parts.append(_section("DOCKPILOT-PROTOCOL DOCK (MCU)", _mcu_state(od_snapshot)))
 
     # --- app command log ---
     if log_lines:
@@ -2171,9 +2639,9 @@ def build_snapshot(iface=None, log_lines=None, dockpilot_version="unknown"):
     return "\n".join(parts)
 
 
-def write_snapshot(iface=None, log_lines=None, dockpilot_version="unknown", directory=None):
+def write_snapshot(iface=None, log_lines=None, dockpilot_version="unknown", directory=None, od_snapshot=None):
     """Build the snapshot and write it to a timestamped file. Returns the path."""
-    text = build_snapshot(iface, log_lines, dockpilot_version)
+    text = build_snapshot(iface, log_lines, dockpilot_version, od_snapshot)
     directory = directory or os.path.expanduser("~")
     path = os.path.join(directory, "dockpilot-snapshot-%s.txt" % time.strftime("%Y%m%d-%H%M%S"))
     with open(path, "w") as f:

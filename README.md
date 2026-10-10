@@ -29,6 +29,11 @@ what's really going on, and lets you control it.
 - **Wake-on-LAN.** Wake your machine over the dock's wired link, and send magic packets to wake
   other machines on your network.
 - **Live dashboard.** Throughput, link health, latency, and what chip your dock actually contains.
+- **Names the chip.** The Identity page says what is really inside — down to the exact Realtek
+  part and silicon revision when the kernel names it (RTL8153A-3, RTL8156B-2 …), including
+  Realtek chips sold under Lenovo, Microsoft, TP-Link, Samsung, Linksys, Nvidia and ASUS USB ids,
+  the docks Realtek's own driver knows by name, which USB configuration is the native one, and
+  whether the dock can carry your laptop's own MAC through from BIOS.
 - **Dock map.** A live diagram of the dock's internals — its hubs, ports, and what's plugged into
   each — scoped to the dock, not your laptop.
 - **Per-device control.** Enable or disable individual devices behind the dock; switch port power
@@ -63,6 +68,22 @@ Every device below was tested on a real machine.
 
 ---
 
+## OpenDock — docks that talk back
+
+Most docks are anonymous boxes. A dock built with the OpenDock management chip speaks a small
+open protocol over a USB serial port: it says what it is, keeps a name, asset tag and site in its
+own flash, and remembers what happened to it — power-ups, laptops docking and undocking,
+temperature — even when nothing was listening.
+
+DockPilot finds such a dock by itself and shows it on the **OpenDock** page. Two macro triggers,
+`opendock_connect` and `opendock_disconnect`, carry the dock's identity (`DOCK_SERIAL`,
+`DOCK_NAME`, `DOCK_ASSETTAG`, `DOCK_SITE`). It needs one extra package: `pip install pyserial`.
+
+The same code is a command-line tool: `python3 opendock.py list | status | log | set name "…" | watch`.
+
+Want to build a dock that speaks it, or script one yourself? The protocol fits on one page:
+[PROTOCOL.md](PROTOCOL.md).
+
 ## Install & run
 
 Requires Python 3 with Tk (`python3-tk` on Debian/Ubuntu if your Python lacks it).
@@ -86,6 +107,8 @@ pip install -r requirements.txt
 python3 dockpilot.py
 ```
 
+For OpenDock docks add `pip install pyserial` (or install with `pip install "dockpilot[opendock]"`) — everything else works without it.
+
 Optional system tools unlock extra panels (each auto-hides if absent): `ethtool` (link tuning, WoL, EEPROM), `usbutils`, `uhubctl` (per-port power), `network-manager`/`nmcli` (Wi-Fi auto-switch, reconnect), `pactl` (audio).
 
 ```bash
@@ -102,6 +125,7 @@ and **no personal data ships with the project**:
 - `config/automation.json` — your connect/disconnect rules (created when you set them)
 - `config/dock_memory.json` — remembered per-dock native-mode verdicts
 - `config/dock_state.json` — captured original MAC (so "reset MAC" always works)
+- `config/opendock_log_<chip id>.json` — the collected event log of each OpenDock seen
 
 ---
 
@@ -123,6 +147,15 @@ hides the chip's advanced features. Their native/vendor config exposes everythin
 `ax88179_178a` (ASIX) or `r8152` (Realtek). DockPilot switches by writing the device's
 `bConfigurationValue` in sysfs, then re-checks the driver and link, and reverts if the link
 doesn't come up. Fully reversible — unplugging the dock always returns it to standard mode.
+
+**Where the chip names come from.** Realtek publishes its `r8152` driver source. Its USB device
+table, the dock ids it names, its MAC pass-through rules and the way it finds the native
+configuration (by interface class — "the vendor mode is not always config #1") are all in there,
+and DockPilot reads the same facts from sysfs without that driver installed. The exact part and
+silicon revision come from the firmware file the in-kernel `r8152` loads (`ethtool -i` shows it as
+`rtl8153a-3 v2 …`); a chip still in CDC mode only shows what its product id says. Parts with
+three configurations (product id `8053`, hardware rev `e0.xx`: NCM, ECM, then native as #3) unlock
+correctly now that the native config is found rather than assumed.
 
 **`r8152-cfgselector`.** Recent kernels ship a helper that performs the same
 `bConfigurationValue` switch for Realtek NICs automatically at plug-in. So modern Realtek
