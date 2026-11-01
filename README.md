@@ -4,8 +4,8 @@ A vendor-neutral **admin console for USB-C / Thunderbolt docks and hubs on Ubunt
 
 Docks hide most of what their hardware can actually do, and on Linux no vendor gives you a tool
 to change that. DockPilot works out what's inside your dock, unlocks what it safely can, shows you
-what's really going on, and lets you control it — in a window that looks like Ubuntu's own
-Settings, with a background service and a top-bar tile.
+what's really going on, and lets you control it — see more on [OpenDockTech](https://opendocktech.com)
+for Docking Stations that are fully compatible with this software. 
 
 ![DockPilot dashboard](screenshots/01-dashboard.png)
 
