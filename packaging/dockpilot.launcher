@@ -1,0 +1,3 @@
+#!/bin/sh
+# DockPilot launcher: everything lives in /usr/lib/dockpilot.
+exec /usr/bin/python3 /usr/lib/dockpilot/dockpilot.py "$@"

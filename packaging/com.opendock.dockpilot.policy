@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>OpenDock</vendor>
+  <vendor_url>https://github.com/dinnerisserved/dockpilot</vendor_url>
+  <icon_name>dockpilot</icon_name>
+  <action id="com.opendock.dockpilot.helper">
+    <description>Change a dock's network or USB settings</description>
+    <message>DockPilot wants to change settings of the docking station (network chip offloads, speed, MAC address, USB port power).</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/dockpilot/dockpilot_helper.py</annotate>
+  </action>
+</policyconfig>

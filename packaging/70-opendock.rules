@@ -1,0 +1,4 @@
+# OpenDock: the dock's management chip appears as a USB serial device that announces itself
+# as "OpenDock". Give it to whoever is logged in at the screen (no dialout group needed) and
+# name it /dev/opendock0 as well as the usual ttyACM*.
+SUBSYSTEM=="tty", ATTRS{manufacturer}=="OpenDock", TAG+="uaccess", SYMLINK+="opendock%n"
