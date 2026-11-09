@@ -125,6 +125,27 @@ def op_eeprom_get(a):
     return cmd(["ethtool", "-e", i, "offset", "0", "length", "64"])
 
 
+POWER_SUPPLY = "/sys/class/power_supply"
+
+
+def op_charge_limit(a):
+    """charge-limit N: stop charging the laptop's battery at N % (50-100) while docked.
+    Only on laptops whose firmware exposes the threshold; the dock is not involved."""
+    need(len(a) == 1 and a[0].isdigit() and 50 <= int(a[0]) <= 100, "charge-limit 50..100")
+    done = 0
+    try:
+        bats = sorted(d for d in os.listdir(POWER_SUPPLY) if d.startswith("BAT"))
+    except OSError:
+        bats = []
+    for b in bats:
+        p = os.path.join(POWER_SUPPLY, b, "charge_control_end_threshold")
+        if DRY or os.path.exists(p):
+            sysfs_write(p, a[0])
+            done += 1
+    need(done > 0, "this laptop has no charge threshold control")
+    return 0
+
+
 def op_pause(a):
     need(len(a) == 2 and a[1] in ONOFF, "pause IFACE on|off")
     return cmd(["ethtool", "-A", iface(a[0]), "rx", a[1], "tx", a[1]])
@@ -202,7 +223,7 @@ def op_install_udev_rule(a):
 
 
 OPS = {
-    "offload": op_offload, "speed": op_speed, "wol": op_wol, "wol-get": op_wol_get, "eeprom-get": op_eeprom_get, "pause": op_pause,
+    "offload": op_offload, "speed": op_speed, "wol": op_wol, "wol-get": op_wol_get, "eeprom-get": op_eeprom_get, "charge-limit": op_charge_limit, "pause": op_pause,
     "renegotiate": op_renegotiate, "mac": op_mac, "link-up": op_link_up,
     "usb-authorize": op_usb_authorize, "usb-config": op_usb_config,
     "usb-ports": op_usb_ports, "usb-port": op_usb_port,
@@ -242,7 +263,7 @@ def serve():
 
 
 def main(argv):
-    global DRY, USB_DEVICES, USB_DRIVERS, NET
+    global DRY, USB_DEVICES, USB_DRIVERS, NET, POWER_SUPPLY
     if argv and argv[0] == "--dry-run":          # tests only: print instead of doing, under a fake /sys
         DRY = True
         argv = argv[1:]
@@ -250,6 +271,7 @@ def main(argv):
             USB_DEVICES = os.path.join(argv[1], "bus/usb/devices")
             USB_DRIVERS = os.path.join(argv[1], "bus/usb/drivers")
             NET = os.path.join(argv[1], "class/net")
+            POWER_SUPPLY = os.path.join(argv[1], "class/power_supply")
             argv = argv[2:]
     if argv == ["--serve"]:
         serve()

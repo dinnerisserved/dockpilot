@@ -31,10 +31,10 @@ class DockToggle extends QuickMenuToggle {
         super._init({
             title: 'Dock',
             subtitle: 'no dock',
-            iconName: 'network-wired-symbolic',
+            iconName: 'dockpilot-symbolic',
             toggleMode: false,
         });
-        this.menu.setHeader('network-wired-symbolic', 'DockPilot');
+        this.menu.setHeader('dockpilot-symbolic', 'DockPilot');
         this._nic = new PopupMenu.PopupMenuItem('', {reactive: false});
         this._od = new PopupMenu.PopupMenuItem('', {reactive: false});
         this.menu.addMenuItem(this._nic);
@@ -64,6 +64,7 @@ class DockToggle extends QuickMenuToggle {
         }
         const nic = s.nic || {};
         const od = s.opendock || {};
+        // a dock is "there" if either half is: its network chip, or an OpenDock brain on the serial port
         if (nic.iface) {
             const up = !!nic.carrier;
             this.checked = up;
@@ -71,10 +72,14 @@ class DockToggle extends QuickMenuToggle {
             this._nic.label.text = up
                 ? `${nic.iface} · ${nic.speed || ''} · ↓${(nic.rx_mbps || 0).toFixed(1)} ↑${(nic.tx_mbps || 0).toFixed(1)} Mb/s`
                 : `${nic.iface} · link down`;
+        } else if (od.connected) {
+            this.checked = true;
+            this.subtitle = od.docked === false ? 'OpenDock · idle' : 'OpenDock';
+            this._nic.label.text = 'No network chip on this dock';
         } else {
             this.checked = false;
             this.subtitle = 'no dock';
-            this._nic.label.text = 'No dock network chip';
+            this._nic.label.text = 'No dock';
         }
         if (od.connected) {
             let t = `OpenDock ${od.name || od.serial || ''}`;
@@ -93,9 +98,17 @@ class DockIndicator extends SystemIndicator {
         super._init();
         this._toggle = new DockToggle();
         this.quickSettingsItems.push(this._toggle);
+        // The icon in the top bar itself: shown only while docked at an OpenDock whose
+        // seat has the "Show icon in top bar" rule on (status.opendock.tile).
+        this._icon = this._addIndicator();
+        this._icon.icon_name = 'dockpilot-symbolic';
+        this._icon.visible = false;
     }
     refresh() {
         this._toggle.refresh();
+        const s = readStatus();
+        const od = (s && !s.stale && s.opendock) || {};
+        this._icon.visible = !!od.tile;
     }
 });
 

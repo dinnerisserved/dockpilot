@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dockpilot"
-version = "1.0.0"
+version = "1.2"
 description = "See and manage your laptop docking station — Ubuntu-native (GTK 4 / libadwaita)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
-authors = [{ name = "dinnerisserved" }]
+authors = [{ name = "OpenDock", email = "hello@opendocktech.com" }]
 license = "MIT"
 classifiers = [
     "Environment :: X11 Applications :: GTK",
@@ -24,6 +24,7 @@ Homepage = "https://github.com/dinnerisserved/dockpilot"
 [project.scripts]
 dockpilot = "dockpilot_pkg.__main__:main"
 dockpilotd = "dockpilot_pkg.__main__:daemon"
+opendock = "dockpilot_pkg.__main__:cli"
 
 [project.optional-dependencies]
 opendock = ["pyserial"]

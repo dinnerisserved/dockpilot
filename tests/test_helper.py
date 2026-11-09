@@ -18,7 +18,7 @@ HELPER = os.path.join(HERE, "..", "dockpilot", "dockpilot_helper.py")
 def sysfs(tmp_path_factory):
     root = tmp_path_factory.mktemp("sys")
     for d in ("class/net/eth0", "class/net/enx00e04c680123", "bus/usb/devices/1-3.2",
-              "bus/usb/devices/2-1", "bus/usb/drivers/r8152", "bus/usb/drivers/cdc_ncm"):
+              "bus/usb/devices/2-1", "bus/usb/drivers/r8152", "bus/usb/drivers/cdc_ncm", "class/power_supply/BAT0"):
         os.makedirs(root / d)
     return str(root)
 
@@ -50,6 +50,8 @@ GOOD = [
     (["usb-port", "1-3", "2", "cycle"], "run uhubctl -l 1-3 -p 2 -a cycle"),
     (["usb-port", "2-1.4", "12", "off"], "run uhubctl -l 2-1.4 -p 12 -a off"),
     (["install-udev-rule"], "write /etc/udev/rules.d/70-opendock.rules <- (rule)"),
+    (["charge-limit", "80"], "write {sys}/class/power_supply/BAT0/charge_control_end_threshold <- 80"),
+    (["charge-limit", "100"], "write {sys}/class/power_supply/BAT0/charge_control_end_threshold <- 100"),
 ]
 
 
@@ -113,6 +115,10 @@ BAD = [
     ["rm", "-rf", "/"],
     ["--serve", "x"],
     ["install-udev-rule", "/etc/passwd"],
+    ["charge-limit", "40"],
+    ["charge-limit", "101"],
+    ["charge-limit", "80", "BAT1"],
+    ["charge-limit", "8o"],
 ]
 
 

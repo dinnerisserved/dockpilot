@@ -38,3 +38,39 @@ def test_daemon_socket_and_status(tmp_path):
     finally:
         p.terminate()
         p.wait(5)
+
+
+def test_ensure_extension_enabled_adds_the_uuid(monkeypatch, tmp_path):
+    """With a fake Gio.Settings: the uuid is appended once, never duplicated, and gnome-extensions is asked to load it."""
+    import types
+    sys.path.insert(0, ROOT); import dockpilot_core as core  # noqa: E402
+    calls = []
+    store = {"enabled-extensions": ["other@x"]}
+
+    class FakeSettings:
+        def __init__(self, schema): calls.append(("new", schema))
+        def get_strv(self, k): return list(store[k])
+        def set_strv(self, k, v): store[k] = list(v)
+        def sync(self): pass
+
+    class FakeSource:
+        def lookup(self, name, recursive): return object() if name == "org.gnome.shell" else None
+    fake_gio = types.SimpleNamespace(Settings=types.SimpleNamespace(new=lambda schema: FakeSettings(schema)),
+                                     SettingsSchemaSource=types.SimpleNamespace(get_default=lambda: FakeSource()))
+    fake_repo = types.SimpleNamespace(Gio=fake_gio)
+    monkeypatch.setitem(sys.modules, "gi", types.SimpleNamespace(repository=fake_repo))
+    monkeypatch.setitem(sys.modules, "gi.repository", fake_repo)
+    monkeypatch.setattr(core.os.path, "isdir", lambda p: p.endswith(core.EXTENSION_UUID))
+    ran = []
+    monkeypatch.setattr(core.subprocess, "run", lambda *a, **k: ran.append(a[0]))
+    assert core.ensure_extension_enabled() is True
+    assert store["enabled-extensions"] == ["other@x", core.EXTENSION_UUID]
+    assert ran == [["gnome-extensions", "enable", core.EXTENSION_UUID]]
+    assert core.ensure_extension_enabled() is False                 # already there: nothing written
+    assert store["enabled-extensions"] == ["other@x", core.EXTENSION_UUID]
+
+
+def test_ensure_extension_enabled_without_the_extension_installed(monkeypatch):
+    sys.path.insert(0, ROOT); import dockpilot_core as core  # noqa: E402
+    monkeypatch.setattr(core.os.path, "isdir", lambda p: False)
+    assert core.ensure_extension_enabled() is False

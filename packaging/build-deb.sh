@@ -7,7 +7,7 @@ VER=$(python3 -c "import re;print(re.search(r'APP_VERSION = \"([^\"]+)\"', open(
 B=build/deb
 EXT=dockpilot@opendock.io
 rm -rf build && mkdir -p $B/DEBIAN $B/usr/lib/dockpilot $B/usr/bin $B/usr/share/applications \
-      $B/usr/share/icons/hicolor/scalable/apps $B/usr/share/polkit-1/actions $B/usr/share/doc/dockpilot \
+      $B/usr/share/icons/hicolor/scalable/apps $B/usr/share/icons/hicolor/symbolic/apps $B/usr/share/polkit-1/actions $B/usr/share/doc/dockpilot \
       $B/usr/lib/systemd/user $B/usr/lib/udev/rules.d $B/usr/share/gnome-shell/extensions/$EXT
 
 install -m 644 dockpilot/dockpilot.py dockpilot/dockpilot_core.py dockpilot/opendock.py $B/usr/lib/dockpilot/
@@ -15,8 +15,10 @@ install -m 755 dockpilot/dockpilot_helper.py $B/usr/lib/dockpilot/
 install -m 755 packaging/dockpilot.launcher $B/usr/bin/dockpilot
 install -m 755 packaging/enable-extension.sh $B/usr/lib/dockpilot/
 install -m 755 packaging/dockpilotd.launcher $B/usr/bin/dockpilotd
+install -m 755 packaging/opendock.launcher $B/usr/bin/opendock
 install -m 644 packaging/dockpilot.desktop $B/usr/share/applications/
 install -m 644 packaging/dockpilot.svg $B/usr/share/icons/hicolor/scalable/apps/
+install -m 644 packaging/dockpilot-symbolic.svg $B/usr/share/icons/hicolor/symbolic/apps/
 install -m 644 packaging/com.opendock.dockpilot.policy $B/usr/share/polkit-1/actions/
 install -m 644 packaging/dockpilot.service $B/usr/lib/systemd/user/
 install -m 644 packaging/70-opendock.rules $B/usr/lib/udev/rules.d/
@@ -31,7 +33,7 @@ Priority: optional
 Architecture: all
 Depends: python3 (>= 3.10), python3-gi, python3-gi-cairo, gir1.2-gtk-4.0, gir1.2-adw-1, python3-serial, ethtool, pkexec, iproute2, udev, libnotify-bin
 Recommends: uhubctl, usbutils, network-manager, gnome-shell-extension-prefs
-Maintainer: OpenDock <dockpilot@opendock.local>
+Maintainer: OpenDock <hello@opendocktech.com>
 Homepage: https://github.com/dinnerisserved/dockpilot
 Description: see and manage your laptop docking station
  DockPilot shows what is inside a USB-C dock (network chip, ports, power), lets

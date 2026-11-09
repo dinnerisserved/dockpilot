@@ -1,11 +1,13 @@
 # DockPilot
 
+*By [opendocktech.com](https://opendocktech.com). Free software, for Ubuntu.*
+
 A vendor-neutral **admin console for USB-C / Thunderbolt docks and hubs on Ubuntu.**
 
 Docks hide most of what their hardware can actually do, and on Linux no vendor gives you a tool
 to change that. DockPilot works out what's inside your dock, unlocks what it safely can, shows you
 what's really going on, and lets you control it — see more on [OpenDockTech](https://opendocktech.com)
-for Docking Stations that are fully compatible with this software. 
+for Docking Stations that are fully compatible with this software.
 
 ![DockPilot dashboard](screenshots/01-dashboard.png)
 
@@ -46,6 +48,9 @@ for Docking Stations that are fully compatible with this software.
 - **Automation.** Turn Wi-Fi off when you dock, mirror your laptop's MAC, switch audio to the dock.
 - **Tidy-up tools.** Clean up leftover network profiles, inspect chip configuration (read-only),
   and tune link speed and offloads where the hardware allows.
+- **OpenDock.** A dock with the OpenDock board inside stores the desk's network settings and
+  your own rules, and gives them to whichever laptop plugs in. It also has its own web page and
+  takes firmware updates from a file. See [OpenDock](#opendock) below.
 
 ## Tested hardware
 
@@ -68,30 +73,62 @@ Every device below was tested on a real machine.
 
 ---
 
-## OpenDock — docks that talk back
+## OpenDock
 
-Most docks are anonymous boxes. A dock built with the OpenDock management chip speaks a small
-open protocol over a USB serial port: it says what it is, keeps a name, asset tag and site in its
-own flash, and remembers what happened to it — power-ups, laptops docking and undocking,
-temperature — even when nothing was listening.
+Most docks are anonymous boxes. A dock built with the OpenDock board from
+[opendocktech.com](https://opendocktech.com) answers questions over a USB serial port, and from
+firmware 0.6 it stores the settings of the desk it sits on. Plug a laptop in and DockPilot reads
+those settings and applies them; unplug it and they are removed again. The dock stores; DockPilot
+does the work on the laptop.
 
-DockPilot finds such a dock by itself and shows it on the **OpenDock** page. Two macro triggers,
-`opendock_connect` and `opendock_disconnect`, carry the dock's identity (`DOCK_SERIAL`,
-`DOCK_NAME`, `DOCK_ASSETTAG`, `DOCK_SITE`). It needs one extra package: `pip install pyserial`.
+The **OpenDock** page has four tabs:
 
-The same code is a command-line tool: `python3 dockpilot/opendock.py list | status | log | set name "…" | watch`.
+- **Dock.** What it is, how it's doing (health, temperature, power on the host port, lifetime
+  counters), where its own page is (from firmware 1.0 the dock is also a tiny web server on the
+  cable: `http://opendock.local`, any browser, any computer, no app), a *Firmware → Update…*
+  button that sends a new firmware file to the dock, and *At this desk*: what the dock handed to
+  this laptop — VLAN, MTU, address, DNS, time, proxy, VPN — applied while docked.
+- **Setup.** What is kept in the dock: the desk tag, the nine desk options (validated by the dock
+  itself), and key storage — up to 64 named values for anything else, read and written by
+  scripts with `opendock get|set|del <name>` and `opendock keys`, or by anything that can fetch a
+  URL: `http://opendock.local/key/<name>`. *Export* writes the whole desk as a text file; *Apply from file* sends one
+  back in a single write, so fifty docks are provisioned from one file.
+- **Rules.** This laptop at this desk: Wi-Fi off while docked, sound through the dock, lock or
+  mute on undock, touchpad off, use the desk's VPN or proxy, show the icon in the top bar; your own
+  commands on dock and undock; a saved configuration (screens, sound, keyboard, VPN) restored every
+  time you dock, saved again on undock if you like. All of it is stored in the dock under a seat
+  key only your laptops know — the dock never learns who you are. *Show my key* gives six words to
+  type into DockPilot on your other laptop, which then is the same seat at every dock.
+- **Records.** Hours docked per day from the dock's own log, the log file (export, clear), and the
+  configuration record an inventory system receives (`opendock-report/2`, also kept up to date in
+  `~/.cache/dockpilot/opendock-<serial>.json`).
 
-Want to build a dock that speaks it, or script one yourself? The protocol fits on one page:
+A dock with older firmware still shows Dock and Records; Setup and Rules say what is missing.
+
+**Firmware updates** (firmware 1.0 and later): the dock keeps two copies of its firmware. An
+update goes into the copy that is not running, the dock restarts with it, and if the new firmware
+does not start cleanly the dock comes back on the old one by itself. The same works from the
+dock's own page, so a Windows or Mac laptop can update a dock too. Firmware files, the developer
+guide and the docks themselves come from [opendocktech.com](https://opendocktech.com).
+
+Two macro triggers, `opendock_connect` and `opendock_disconnect`, carry the dock's identity
+(`DOCK_SERIAL`, `DOCK_TAG`). Needs pyserial.
+
+The same code is a command-line tool:
+`opendock list | status | desk | get <name> | export | import <file> | log | set name "…" | watch`
+(`python3 dockpilot/opendock.py` from a checkout).
+
+Want to build a dock that speaks it, or script one yourself? The protocol fits on a few pages:
 [PROTOCOL.md](PROTOCOL.md).
 
 ## Install & run
 
-**Ubuntu (recommended) — the .deb.** Download `dockpilot_1.0.0-1_all.deb` from the
+**Ubuntu (recommended) — the .deb.** Download `dockpilot_1.2-1_all.deb` from the
 [latest release](https://github.com/dinnerisserved/dockpilot/releases), double-click it (App
 Center → **Install**) or:
 
 ```bash
-sudo apt install ./dockpilot_1.0.0-1_all.deb
+sudo apt install ./dockpilot_1.2-1_all.deb
 ```
 
 Log out and in once. You get DockPilot in the app menu, a background service that runs your
@@ -116,7 +153,8 @@ Optional extras that unlock more panels: `sudo apt install uhubctl usbutils netw
 
 ## Configuration
 
-Settings live in `~/.config/dockpilot` (rules, remembered docks, the original MAC, OpenDock logs).
+Settings live in `~/.config/dockpilot` (rules, remembered docks, the original MAC, OpenDock logs,
+and `seat_key` — the six words that are your seat at every OpenDock; copy that file to keep them).
 Nothing personal ships with the project; delete that folder for a clean slate.
 
 ---
@@ -196,12 +234,12 @@ and ASIX's published driver sources; `uhubctl` for per-port power; `ethtool`, `f
 sysfs USB/net interfaces. What DockPilot adds is the synthesis: detect the chip, attempt the
 unlock, verify it works, degrade honestly when it doesn't, and present it in a GUI.
 
-**Status.** 1.0 is the finished version. It does what it set out to do and isn't planned to grow;
-the code is small and commented, so fork away.
+**Status.** The generic tool (chip naming, native mode, offloads, automation) is complete. What
+grows from here is the OpenDock side, as the docks do — follow [opendocktech.com](https://opendocktech.com).
 
 ## License
 
-See [LICENSE](LICENSE).
+See [LICENSE](LICENSE). Made by [opendocktech.com](https://opendocktech.com) — hello@opendocktech.com.
 
 ## Disclaimer
 

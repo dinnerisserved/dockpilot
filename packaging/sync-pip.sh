@@ -7,7 +7,7 @@ cd "$(dirname "$0")/.."
 P=pip_build/dockpilot_pkg
 rm -rf pip_build dist && mkdir -p $P/packaging/gnome-extension
 cp dockpilot/*.py $P/
-cp packaging/70-opendock.rules packaging/dockpilot.service packaging/com.opendock.dockpilot.policy packaging/dockpilot.desktop packaging/dockpilot.svg $P/packaging/
+cp packaging/70-opendock.rules packaging/dockpilot.service packaging/com.opendock.dockpilot.policy packaging/dockpilot.desktop packaging/dockpilot.svg packaging/dockpilot-symbolic.svg $P/packaging/
 cp packaging/gnome-extension/metadata.json packaging/gnome-extension/extension.js $P/packaging/gnome-extension/
 cat > $P/__init__.py <<'PY'
 """dockpilot — the pip packaging of DockPilot. Same files as the .deb; see README."""
@@ -29,6 +29,11 @@ def main():
 def daemon():
     import dockpilot_core
     sys.exit(dockpilot_core.service_main())
+
+
+def cli():
+    import opendock
+    sys.exit(opendock.main())
 
 
 if __name__ == "__main__":

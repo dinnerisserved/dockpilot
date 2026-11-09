@@ -2,7 +2,7 @@
   "uuid": "dockpilot@opendock.io",
   "name": "DockPilot",
   "description": "Shows your dock's state in the top bar and opens DockPilot.",
-  "shell-version": ["45", "46", "47", "48"],
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
   "url": "https://github.com/dinnerisserved/dockpilot",
   "version": 1
 }

@@ -9,10 +9,12 @@ opendock.py is the protocol client for docks with the OpenDock management board.
 
 Run:  python3 dockpilot.py        (the .deb installs it as `dockpilot`)
 """
+import json
 import os
 import re
 import sys
 import threading
+import time
 
 try:
     import gi
@@ -148,7 +150,7 @@ class Window(Adw.ApplicationWindow):
 
         engine.on("log", self._on_log)
         engine.on("native", self._on_native_status)
-        engine.on("opendock", lambda what: self._refresh_if("OpenDock"))
+        engine.on("opendock", self._on_opendock_evt)
         engine.on("transition", lambda up: self._refresh_if("Network"))
         self.nav.select_row(self.nav.get_row_at_index(0))
         GLib.timeout_add(1000, self._tick)
@@ -178,12 +180,15 @@ class Window(Adw.ApplicationWindow):
         self.page_name = name
         self.widgets = {}
         self.content_page.set_title(name)
+        self.content_hb.set_title_widget(None)
         page = Adw.PreferencesPage()
         builder = {"Dashboard": self.page_dashboard, "Network": self.page_network, "Native Mode": self.page_native,
                    "USB & Power": self.page_usb, "Topology": self.page_topology, "Audio": self.page_audio,
                    "Automation": self.page_automation, "Logs": self.page_logs, "OpenDock": self.page_opendock}[name]
+        self._od_direct = False
         builder(page)
-        self.content_view.set_content(page)
+        if not self._od_direct:
+            self.content_view.set_content(page)
 
     def _refresh_if(self, name):
         if self.page_name == name:
@@ -221,6 +226,9 @@ class Window(Adw.ApplicationWindow):
         elif self.page_name == "Native Mode":
             self._native_tick()
         return True
+
+    def _on_opendock_evt(self, what):
+        self._refresh_if("OpenDock")
 
     def _on_log(self, line):
         tv = self.widgets.get("logview")
@@ -689,8 +697,8 @@ class Window(Adw.ApplicationWindow):
     # ---- Automation --------------------------------------------------------------------------------
     def page_automation(self, page):
         e = self.engine
-        g = group("When the dock connects or disconnects", "Each rule fires when the dock's wired link actually goes up or down. Ticking a switch takes effect at the next such event."
-                  + ("" if self.use_service else "") )
+        g = group("When a dock connects or disconnects", "For docks without an OpenDock board. At an OpenDock, the dock's own page decides instead and these stand down.")
+        at_od = bool((e.od_snap or {}).get("connected"))
         for key, title, sub, tool in (("wifi", "Wi-Fi off when docked", "Turned back on when the dock disconnects.", "nmcli"),
                                       ("audio", "Audio to the dock", "Switch the audio output to the dock on connect.", "pactl")):
             sr = Adw.SwitchRow()
@@ -700,6 +708,9 @@ class Window(Adw.ApplicationWindow):
             if not core.have(tool):
                 sr.set_sensitive(False)
                 sr.set_subtitle("Needs %s." % tool)
+            elif at_od:
+                sr.set_sensitive(False)
+                sr.set_subtitle("An OpenDock is connected — this is set on the OpenDock page, under Rules.")
             sr.connect("notify::active", lambda w, _p, k=key: e.set_rule(k, w.get_active()))
             g.add(sr)
         page.add(g)
@@ -881,61 +892,492 @@ class Window(Adw.ApplicationWindow):
 
     # ---- OpenDock ---------------------------------------------------------------------------------------
     def page_opendock(self, page):
+        """Four tabs when a dock is present — Dock, Setup, Rules, Records — one card when it is not."""
         e = self.engine
-        g = group("OpenDock", "A dock with the management chip inside speaks a small open protocol over a USB serial port. "
-                             "It says what it is, keeps a few settings, and remembers what happened to it.")
-        page.add(g)
-        if core.opendock is None:
-            g.add(row("Missing", "opendock.py is not beside DockPilot.", prop=False))
-            return
-        if core.opendock.serial is None and not self.use_service:
-            g.add(row("Needs pyserial", "pip install pyserial, then restart DockPilot", prop=False))
+        self.content_hb.set_title_widget(None)
+        if core.opendock is None or (core.opendock.serial is None and not self.use_service):
+            g = group("OpenDock")
+            g.add(row("Needs pyserial", "sudo apt install python3-serial, then restart DockPilot", prop=False))
+            page.add(g)
             return
         snap = e.od_snap or {}
         if not snap.get("connected"):
+            g = group("OpenDock", "A dock with the OpenDock board inside holds the desk: its name, its network options, your rules and your saved configuration.")
             why = snap.get("error") or "Plug one in — it is found within a few seconds."
             if why.startswith("no reply") or why.startswith("port write failed"):
                 why = "The dock stopped answering — unplugged? It is picked up again within a few seconds."
             g.add(row("No OpenDock found", why, prop=False))
-            hint = core.dialout_hint()
-            if hint:
+            if core.dialout_hint():
                 g.add(button_row("Serial port permission", "Install the udev rule once and the dock is yours without any group change.",
                                  button("Allow access", self._install_udev)))
+            page.add(g)
             return
+
+        stack = Adw.ViewStack()
+        for name, icon, builders in (("Dock", "view-grid-symbolic", (self._tab_dock,)),
+                                     ("Setup", "document-edit-symbolic", (self._tab_setup,)),
+                                     ("Rules", "emblem-system-symbolic", (self._tab_rules,)),
+                                     ("Records", "text-x-generic-symbolic", (self._tab_records,))):
+            pg = Adw.PreferencesPage()
+            for b in builders:
+                b(pg, snap)
+            stack.add_titled_with_icon(pg, name, name, icon)
+        sw = Adw.ViewSwitcher()
+        sw.set_stack(stack)
+        sw.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+        self.content_hb.set_title_widget(sw)
+        self.widgets["od_stack"] = stack
+        if getattr(self, "_od_tab", None):
+            stack.set_visible_child_name(self._od_tab)
+        stack.connect("notify::visible-child-name", lambda st, _p: setattr(self, "_od_tab", st.get_visible_child_name()))
+        stack.set_vexpand(True)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(stack)
+        foot = Gtk.Label(label=core.WEBSITE)
+        foot.add_css_class("dim-label")
+        foot.set_margin_top(10)
+        foot.set_margin_bottom(14)
+        box.append(foot)
+        self.content_view.set_content(box)
+        self._od_direct = True
+
+    @staticmethod
+    def _no_desk(snap):
+        """A line for a dock whose firmware keeps no desk (before 0.6), or None."""
+        if snap.get("desk") is not None:
+            return None
+        fw = (snap.get("identity") or {}).get("fw", "?")
+        return "This dock's firmware (%s) keeps no desk. Firmware 0.6 or later holds the desk tag, options, keys and your rules." % fw
+
+    @staticmethod
+    def _below(page, *buttons):
+        """Buttons under the box they act on."""
+        g = Adw.PreferencesGroup()
+        box = Gtk.Box(spacing=8)
+        box.set_margin_top(4)
+        for b in buttons:
+            box.append(b)
+        g.add(box)
+        page.add(g)
+
+    @staticmethod
+    def _textbox(text, height=200, editable=False):
+        tv = Gtk.TextView()
+        tv.set_editable(editable)
+        tv.set_monospace(True)
+        tv.get_buffer().set_text(text)
+        sw = Gtk.ScrolledWindow()
+        sw.set_min_content_height(height)
+        sw.set_child(tv)
+        sw.add_css_class("card")
+        return tv, sw
+
+    # -- Dock: this dock, right now, at this desk
+    def _tab_dock(self, page, snap):
+        g = group("This dock")
         self.widgets["od_rows"] = {}
-        for k, t in (("serial", "Serial"), ("model", "Model"), ("name", "Name"), ("assettag", "Asset tag"), ("site", "Site"),
-                     ("docked", "Laptop docked"), ("temp", "Temperature"), ("uptime", "Uptime"), ("log", "Log")):
+        rows_spec = [("serial", "Serial"), ("model", "Model")]
+        if snap.get("health") is not None:
+            rows_spec.append(("health", "Health"))
+        rows_spec.append(("tag", "Desk"))
+        if (snap.get("caps") or {}).get("web"):
+            rows_spec.append(("web", "Panel"))
+        rows_spec.append(("site", "Website"))
+        for k, t in rows_spec:
             r = row(t, "—")
             self.widgets["od_rows"][k] = r
             g.add(r)
+        if (snap.get("caps") or {}).get("web"):
+            r = row("Firmware", "—")
+            r.add_suffix(button("Update…", self._firmware_update))
+            self.widgets["od_rows"]["fw"] = r
+            g.add(r)
+        page.add(g)
+        g2 = group("Right now")
+        rows2 = []
+        if (snap.get("status") or {}).get("vbus_v") is not None:
+            rows2.append(("power", "Power"))
+        rows2 += [("temp", "Temperature"), ("uptime", "Running for"), ("log", "Log")]
+        if snap.get("stats") is not None:
+            rows2.append(("stats", "Lifetime"))
+        for k, t in rows2:
+            r = row(t, "—")
+            self.widgets["od_rows"][k] = r
+            g2.add(r)
+        page.add(g2)
+        if snap.get("desk") is not None:
+            g3 = group("At this desk", "What the dock handed to this laptop when it docked. Applied while docked.")
+            for k, t in (("net", "Network"), ("dns", "DNS"), ("time", "Time"), ("proxy", "Proxy"), ("vpn", "VPN"), ("keys", "Keys stored")):
+                r = row(t, "—")
+                self.widgets["od_rows"][k] = r
+                g3.add(r)
+            page.add(g3)
+        else:
+            g3 = group("At this desk")
+            g3.add(row("Nothing handed out", self._no_desk(snap), prop=False))
+            page.add(g3)
         self._opendock_tick()
 
+    # -- Setup: what is kept in the dock
+    def _tab_setup(self, page, snap):
         st = snap.get("status") or {}
-        g2 = group("Settings", "Written into the dock's own flash; up to 64 bytes each. The dock refuses to rewrite the same field more than once every 10 s — if it says wait, DockPilot waits.")
-        for key, label in (("name", "Name"), ("assettag", "Asset tag"), ("site", "Site")):
+        g = group("Kept in the dock")
+        er = Adw.EntryRow()
+        er.set_title("Desk Tag")
+        er.set_text(str(st.get("name", "") or ""))
+        er.set_show_apply_button(True)
+        er.connect("apply", lambda w: self._od_set("name", w.get_text()))
+        g.add(er)
+        page.add(g)
+        why = self._no_desk(snap)
+        if why:
+            g2 = group("Desk options")
+            g2.add(row("Not on this dock", why, prop=False))
+            page.add(g2)
+            return
+        desk = snap.get("desk") or {}
+        opt = desk.get("opt") or {}
+        g2 = group("Desk options", "Apply the DHCP options shown or leave blank. Will be automatically appended every time you connect to this dock from this computer.")
+        for o in snap.get("schema") or []:
             er = Adw.EntryRow()
-            er.set_title(label)
-            er.set_text(str(st.get(key, "") or ""))
+            er.set_title(o["label"] + (" — " + o["hint"] if o.get("hint") else ""))
+            er.set_text(str(opt.get(o["id"], "") or ""))
             er.set_show_apply_button(True)
-            er.connect("apply", lambda w, k=key: self._od_set(k, w.get_text()))
+            er.connect("apply", lambda w, oid=o["id"]: self._desk("set_opt", oid, w.get_text().strip(), note="%s saved" % oid))
             g2.add(er)
         page.add(g2)
-
-        g3 = group("Event log", "What the dock remembers: power-ups, docking and undocking, temperature, settings changes.")
-        tv = Gtk.TextView()
-        tv.set_editable(False)
-        tv.set_monospace(True)
-        entries = snap.get("log") or []
-        tv.get_buffer().set_text("\n".join(core.opendock.describe(x) for x in entries[-200:]) or "(nothing yet)")
-        sw = Gtk.ScrolledWindow()
-        sw.set_min_content_height(240)
-        sw.set_child(tv)
-        sw.add_css_class("card")
-        g3.add(sw)
-        g3.add(button_row("Export or clear", "Export writes a JSON file to your home folder. Clear hides the dock's history; the copy kept here is cleared too.",
-                          button("Export JSON", self._od_export),
-                          button("Clear dock log", lambda: self.confirm("Clear dock log?", "Hide everything the dock has logged so far?", "Clear", self._od_clear, destructive=True), kind="destructive-action")))
+        self._below(page, button("Apply from file", self._desk_import, tooltip="A file made by Export, or written by hand"),
+                    button("Export", self._desk_export, tooltip="A text file in your home folder: the whole desk as it is now"))
+        keys = snap.get("keys") or {}
+        g3 = group("Key storage", "Add keys to store on the docking station for later use.")
+        for k in sorted(keys):
+            er = Adw.EntryRow()
+            er.set_title(k)
+            er.set_text(keys[k])
+            er.set_show_apply_button(True)
+            er.connect("apply", lambda w, name=k: self._desk("set_key", name, w.get_text(), note="%s saved" % name))
+            er.add_suffix(button("Remove", lambda name=k: self._desk("del_key", name, note="%s removed" % name), kind="flat"))
+            g3.add(er)
+        n, nmax = len(keys), int(desk.get("keys_max", 32))
+        g3.add(button_row("Add a key", "%d of %d used" % (n, nmax) if n else "%d free" % nmax, button("Add", self._desk_add_key)))
         page.add(g3)
+
+    # -- Rules: this laptop at this desk
+    def _tab_rules(self, page, snap):
+        why = self._no_desk(snap)
+        if why:
+            g = group("Rules")
+            g.add(row("Not on this dock", why, prop=False))
+            page.add(g)
+            return
+        seat = snap.get("seat") or {}
+        rules_on = seat.get("rules") or {}
+        g = group("Rules", "What the laptop does when it docks here. Stored in the dock, so they follow the desk, not the laptop.")
+        for r in snap.get("rules") or []:
+            tool = core.RULE_TOOLS.get(r["id"], None)
+            known = r["id"] in core.RULE_TOOLS
+            sr = Adw.SwitchRow()
+            sr.set_title(r["label"])
+            sub = r.get("hint") or ""
+            if not known:
+                sub = "This dock knows a rule DockPilot %s does not; stored, not acted on." % core.APP_VERSION
+            elif tool and not core.have(tool):
+                sub = "Not available on this system (needs %s)." % tool
+                sr.set_sensitive(False)
+            sr.set_subtitle(sub)
+            sr.set_active(bool(rules_on.get(r["id"])))
+            sr.connect("notify::active", lambda w, _p, rid=r["id"], lab=r["label"]: self._desk("set_rule", rid, w.get_active(), note="%s: %s" % (lab, "on" if w.get_active() else "off")))
+            g.add(sr)
+        page.add(g)
+
+        cmd = seat.get("cmd") or {}
+        g2 = group("Your own commands", "Run something of your own when you dock or undock — mount a drive, start a backup, open the apps you use at this desk. "
+                   "One command per line, as you would type it in a terminal. Kept in the dock, run by this laptop as you, from your home folder, "
+                   "in the background: there is no terminal, so anything a command prints goes to the Logs page. $DOCK_TAG and $DOCK_SERIAL are set.")
+        for when, title in (("dock", "When I dock"), ("undock", "When I undock")):
+            lines = cmd.get(when) or []
+            ex = Adw.ExpanderRow()
+            ex.set_title(title)
+            ex.set_subtitle("%d command%s" % (len(lines), "" if len(lines) == 1 else "s") if lines else "none")
+            tv, sw = self._textbox("\n".join(lines), height=80, editable=True)
+            ex.add_row(sw)
+            ex.add_row(button_row("Up to 4 lines", "", button("Save", lambda w=when, t=tv: self._desk_cmds(w, t), kind="suggested-action")))
+            g2.add(ex)
+        page.add(g2)
+
+        g3 = group("Saved configuration", "A snapshot of how the laptop is set up at this desk — screens, sound, keyboard, VPN. Kept in the dock, restored every time you dock.")
+        snap_t = seat.get("snap_t") or 0
+        title = ("Saved " + time.strftime("%d %b, %H:%M", time.localtime(snap_t))) if seat.get("snap") and snap_t else ("Saved" if seat.get("snap") else "Nothing saved yet")
+        g3.add(button_row(title, core.snapshot_words(seat.get("snap") or ""),
+                          button("Restore now", self._restore_setup), button("Save current setup", self._save_setup)))
+        sr = Adw.SwitchRow()
+        sr.set_title("Save again every time I undock")
+        sr.set_subtitle("So next time starts exactly where you left it.")
+        sr.set_active(bool(seat.get("autosave")))
+        sr.connect("notify::active", lambda w, _p: self._desk("set_autosave", w.get_active(), note="save on undock: %s" % ("on" if w.get_active() else "off")))
+        g3.add(sr)
+        page.add(g3)
+
+        g4 = group("Your other laptops", "Your rules and configuration are kept in the dock under a key only your laptops know. The dock never learns who you are.")
+        g4.add(button_row("Show my key", "Six words to type into DockPilot on your other laptop.", button("Show", self._seat_show)))
+        g4.add(button_row("Use a key from another laptop", "Makes this laptop the same seat as that one, at every dock.", button("Enter key", self._seat_enter)))
+        g4.add(button_row("Forget me on this dock", "Your rules and saved configuration are removed from the dock; the other laptop loses them too.",
+                          button("Forget", lambda: self.confirm("Forget me on this dock?", "Your rules, commands and saved configuration are deleted from the dock. The key stays; other docks are untouched.",
+                                                                "Forget", lambda: self._desk("forget_seat", note="seat forgotten"), destructive=True), kind="destructive-action")))
+        page.add(g4)
+
+    # -- Records: hours, the log, the configuration
+    def _tab_records(self, page, snap):
+        u = core.ask("usage", days=14) if self.use_service else None
+        u = u.get("usage") if u and u.get("ok") else self.engine.od_usage(14)
+        gc = group("Hours docked, last two weeks")
+        area = Gtk.DrawingArea()
+        area.set_content_height(130)
+        area.set_draw_func(lambda a, cr, W, H: self._draw_usage(a, cr, W, H, u))
+        gc.add(area)
+        words = ["Today %s" % core._hms_short(u["today_s"]) if u["today_s"] else "Today: not yet"]
+        words.append("last 7 days %s in %d session%s" % (core._hms_short(u["week_s"]), u["sessions"], "" if u["sessions"] == 1 else "s") if u["week_s"] else "nothing in the last 7 days")
+        if u["last_used"]:
+            words.append("last used " + time.strftime("%a %d %b, %H:%M", time.localtime(u["last_used"])))
+        lab = Gtk.Label(label=" · ".join(words), xalign=0)
+        lab.add_css_class("dim-label")
+        lab.set_margin_start(8)
+        lab.set_margin_top(4)
+        gc.add(lab)
+        page.add(gc)
+
+        g = group("Log file")
+        entries = snap.get("log") or []
+        tv, sw = self._textbox("\n".join(core.opendock.describe(x) for x in entries[-300:]) or "(nothing yet)")
+        g.add(sw)
+        page.add(g)
+        self._below(page, button("Export", self._od_export, tooltip="A JSON file in your home folder"),
+                    button("Clear", lambda: self.confirm("Clear the dock's log?", "The dock hides everything logged so far. The copy on this laptop is cleared too.", "Clear", self._od_clear, destructive=True)))
+        GLib.idle_add(lambda: tv.scroll_to_mark(tv.get_buffer().get_insert(), 0, False, 0, 0))
+
+        r = core.ask("report") if self.use_service else None
+        rep = r.get("report") if r and r.get("ok") else self.engine.od_report()
+        text = json.dumps(rep, indent=1)
+        g2 = group("Configuration", "What an inventory or network system receives — fixed field names, nothing personal. Also kept as a file in ~/.cache/dockpilot/.")
+        _tv, sw2 = self._textbox(text)
+        g2.add(sw2)
+        page.add(g2)
+        self._below(page, button("Copy", lambda: self._copy(text)))
+
+    # -- actions on the desk / seat
+    def _desk(self, action, *args, note=None):
+        """One write to the dock. Never blocks the window: the switch has already
+        moved; the reply arrives as a toast."""
+        rebuild = action in ("del_key", "set_key", "forget_seat", "import_lines")
+
+        def finish(msg, snap=None):
+            if snap:
+                self.engine.od_snap = snap
+            self.toast(msg, 4)
+            if rebuild:
+                self.show("OpenDock")
+
+        if self.use_service:
+            def worker():
+                r = core.ask("desk", action=action, args=list(args))
+                GLib.idle_add(lambda: (finish((r or {}).get("message", "no reply from the service"), (r or {}).get("opendock")), False)[1])
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            self.engine.od_desk_action(action, *args, done=finish, note=note)
+
+    def _desk_cmds(self, when, tv):
+        buf = tv.get_buffer()
+        lines = [l for l in buf.get_text(buf.get_start_iter(), buf.get_end_iter(), True).splitlines() if l.strip()]
+        if len(lines) > 4:
+            self.toast("Up to 4 lines", 4)
+            return
+        self._desk("set_cmd", when, lines, note="commands saved")
+
+    def _desk_add_key(self):
+        d = Adw.AlertDialog.new("Add a key", "A name (a-z, 0-9, _) and a value up to 128 characters. Scripts read it with:  opendock get <name>")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        name = Gtk.Entry(placeholder_text="name")
+        value = Gtk.Entry(placeholder_text="value")
+        box.append(name)
+        box.append(value)
+        d.set_extra_child(box)
+        d.add_response("cancel", "Cancel")
+        d.add_response("add", "Add")
+        d.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("add")
+        d.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "add":
+                return
+            n = name.get_text().strip().lower()
+            if not re.fullmatch(r"[a-z0-9_]{1,24}", n):
+                self.toast("Key names are a-z, 0-9 and _ (up to 24)", 4)
+                return
+            self._desk("set_key", n, value.get_text(), note="%s saved" % n)
+        d.connect("response", resp)
+        d.present(self)
+
+    def _desk_export(self):
+        if self.use_service:
+            r = core.ask("desk_export")
+            self.toast("Exported: %s" % r["path"] if r and r.get("ok") else "Nothing to export", 6)
+        else:
+            try:
+                p = self.engine.od_desk_export()
+                self.toast("Exported: %s" % p if p else "Nothing to export", 6)
+            except Exception as ex:
+                self.toast("Export failed: %s" % ex, 6)
+
+    def _firmware_update(self):
+        snap = self.engine.od_snap or {}
+        web = (snap.get("caps") or {}).get("web")
+        if not web:
+            return self.toast("This dock has no web face to send firmware to", 5)
+        dlg = Gtk.FileDialog()
+        dlg.set_title("Choose a firmware file (.uf2)")
+
+        def done(d, res):
+            try:
+                f = d.open_finish(res)
+            except Exception:
+                return
+            path = f.get_path()
+            ok, msg = core.opendock.check_uf2(path)
+            if not ok:
+                return self.toast(msg[0].upper() + msg[1:], 7)
+            fw_now = (snap.get("identity") or {}).get("fw")
+            self.confirm("Update the dock's firmware?",
+                         "%s (%s). The dock writes it beside the current firmware and restarts with it — about half a minute. "
+                         "If the new firmware fails to start, the dock comes back on firmware %s by itself. DockPilot reconnects when the dock is back."
+                         % (os.path.basename(path), msg, fw_now), "Upgrade", lambda: start(path))
+
+        def start(path):
+            self.toast("Sending %s to the dock…" % os.path.basename(path), 10)
+
+            def worker():
+                try:
+                    line = core.opendock.update_firmware(web, path)
+                    GLib.idle_add(lambda: (self.info("Firmware written", "%s\n\nThe dock is restarting with the new firmware. Its log will say whether it took (Records → fw_update)." % line), False)[1])
+                except Exception as ex:
+                    why = getattr(ex, "message", None) or str(ex)
+                    GLib.idle_add(lambda: (self.info("Not updated", "%s\n\nThe dock is unchanged." % why), False)[1])
+            threading.Thread(target=worker, daemon=True).start()
+        dlg.open(self, None, done)
+
+    def _desk_import(self):
+        dlg = Gtk.FileDialog()
+        dlg.set_title("Apply a desk from file")
+
+        def done(d, res):
+            try:
+                f = d.open_finish(res)
+            except Exception:
+                return
+            path = f.get_path()
+            try:
+                with open(path) as fh:
+                    lines = fh.read().splitlines()
+            except Exception as ex:
+                self.toast("Couldn't read it: %s" % ex, 5)
+                return
+            self.confirm("Apply this file to the dock?", "The file defines the whole desk: options and keys not in it are removed. One write on the dock.",
+                         "Apply", lambda: self._desk("import_lines", lines, note="desk applied from %s" % os.path.basename(path)))
+        dlg.open(self, None, done)
+
+    def _save_setup(self):
+        if self.use_service:
+            r = core.ask("save_setup")
+            self.toast((r or {}).get("message", "no reply from the service"), 4)
+        else:
+            self.engine.save_snapshot_to_dock(done=lambda msg: self.toast(msg, 4))
+        GLib.timeout_add(800, lambda: (self.show("OpenDock"), False)[1])
+
+    def _restore_setup(self):
+        if self.use_service:
+            r = core.ask("restore_setup")
+            n = (r or {}).get("steps", 0)
+        else:
+            n = self.engine.restore_snapshot()
+        self.toast("Restored (%d things)" % n if n else "Nothing saved to restore", 4)
+
+    def _seat_show(self):
+        if self.use_service:
+            r = core.ask("seat")
+            phrase = (r or {}).get("phrase") or self.engine.seat_phrase
+        else:
+            phrase = self.engine.seat_phrase
+        d = Adw.AlertDialog.new("Your key", "Type these six words into DockPilot on your other laptop (Rules → Use a key from another laptop). Anyone with them is you at every dock.")
+        lab = Gtk.Label(label=phrase, selectable=True)
+        lab.add_css_class("title-3")
+        d.set_extra_child(lab)
+        d.add_response("copy", "Copy")
+        d.add_response("ok", "Done")
+        d.set_default_response("ok")
+        d.connect("response", lambda _d, r: self._copy(phrase) if r == "copy" else None)
+        d.present(self)
+
+    def _seat_enter(self):
+        d = Adw.AlertDialog.new("Use a key from another laptop", "Six words, as shown on the other laptop. This laptop then has that laptop's rules and saved configuration at every dock. Its own seat on this dock is left as it is.")
+        ent = Gtk.Entry(placeholder_text="copper-lantern-orbit-seven-maple-tide")
+        d.set_extra_child(ent)
+        d.add_response("cancel", "Cancel")
+        d.add_response("use", "Use this key")
+        d.set_response_appearance("use", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("use")
+        d.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "use":
+                return
+            ph = core.seat_phrase_clean(ent.get_text())
+            if not ph:
+                self.toast("That isn't a key — six words from the list, separated by dashes or spaces", 5)
+                return
+            if self.use_service:
+                rr = core.ask("seat", phrase=ph)
+                ok = bool(rr and rr.get("ok"))
+                if ok:
+                    self.engine.seat_phrase, self.engine.seat_id = ph, core.seat_id(ph)
+            else:
+                ok = self.engine.use_seat_phrase(ph)
+            self.toast("Key in use — the dock is re-read in a few seconds" if ok else "Couldn't use that key", 5)
+        d.connect("response", resp)
+        d.present(self)
+
+    def _draw_usage(self, area, cr, W, H, u):
+        col = area.get_color()
+        per = u["per_day"]
+        n = len(per)
+        L, R, TOP, BOT = 8, 8, 14, 22
+        peak = max(per + [3600])
+        gap = 4
+        bw = (W - L - R - gap * (n - 1)) / n
+        cr.set_font_size(9.5)
+        for i, sec in enumerate(per):
+            x = L + i * (bw + gap)
+            h = (sec / peak) * (H - TOP - BOT)
+            cr.set_source_rgba(col.red, col.green, col.blue, 0.12)
+            cr.rectangle(x, TOP, bw, H - TOP - BOT)
+            cr.fill()
+            if sec:
+                cr.set_source_rgba(col.red, col.green, col.blue, 0.55)
+                cr.rectangle(x, H - BOT - h, bw, h)
+                cr.fill()
+            day = time.localtime(u["day0"] + 86400 * i)
+            cr.set_source_rgba(col.red, col.green, col.blue, 0.6)
+            cr.move_to(x + bw / 2 - 5, H - 8)
+            cr.show_text(time.strftime("%a", day)[:2])
+        cr.set_source_rgba(col.red, col.green, col.blue, 0.6)
+        cr.move_to(L, 10)
+        cr.show_text("busiest day %s" % core._hms_short(peak) if max(per) else "no docked time in the last %d days" % n)
+
+    def _copy(self, text):
+        try:
+            self.get_clipboard().set(text)
+            self.toast("Copied")
+        except Exception:
+            self.toast("Couldn't reach the clipboard")
 
     def _opendock_tick(self):
         rows = self.widgets.get("od_rows")
@@ -950,19 +1392,50 @@ class Window(Adw.ApplicationWindow):
         i, s = snap.get("identity") or {}, snap.get("status") or {}
         rows["serial"].set_subtitle("%s · chip id %s · on %s" % (i.get("serial"), i.get("uid"), snap.get("port")))
         rows["model"].set_subtitle("%s · firmware %s · protocol v%s" % (i.get("model"), i.get("fw"), i.get("proto")))
-        rows["name"].set_subtitle(s.get("name") or "—")
-        rows["assettag"].set_subtitle(s.get("assettag") or "—")
-        rows["site"].set_subtitle(s.get("site") or "—")
-        docked = ("yes, for %s" % core._hms(s.get("docked_s", 0))) if s.get("docked") else "no"
-        if s.get("vbus_v") is not None:
-            docked += " · VBUS sense %.2f V" % s["vbus_v"]
-        rows["docked"].set_subtitle(docked)
+        rows["tag"].set_subtitle((s.get("name") or "—") + "   (edit under Setup)")
+        web = (snap.get("caps") or {}).get("web")
+        if web and "web" in rows:
+            rows["web"].set_subtitle("http://%s · http://%s — the dock’s own page, any browser, any computer" % (web.get("host"), web.get("ip")))
+        rows["site"].set_subtitle(core.WEBSITE)
+        if "fw" in rows:
+            rows["fw"].set_subtitle("%s — a new one from %s goes in here; the current one stays as the fallback." % (i.get("fw"), core.WEBSITE))
+        if "power" in rows and s.get("vbus_v") is not None:
+            v = s["vbus_v"] * (470 + 47) / 47          # the pin sees VBUS through 470k:47k
+            rows["power"].set_subtitle("%.0f V on the host port" % v if v > 1 else "nothing on the host port")
         rows["temp"].set_subtitle("%s °C" % s.get("temp_c"))
         rows["uptime"].set_subtitle("%s · clock %s" % (core._hms(s.get("uptime_s", 0)), "synced" if s.get("time_synced") else "not synced"))
-        log = "%s entries on the dock (newest #%s), %s kept here" % (s.get("log_entries"), s.get("log_last"), snap.get("log_count", 0))
+        log = "%s entries on the dock, %s kept here" % (s.get("log_entries"), snap.get("log_count", 0))
         if s.get("log_volatile"):
-            log += " · dev jumper fitted: settings cannot be written"
+            log += " · dev jumper fitted: nothing can be written"
         rows["log"].set_subtitle(log)
+        h = snap.get("health")
+        if h is not None and "health" in rows:
+            rows["health"].set_subtitle(core.health_words(h))
+        sx = snap.get("stats")
+        if sx is not None and "stats" in rows:
+            rows["stats"].set_subtitle("%s docked over %s sessions · %s power-ups · hottest %s °C%s" % (
+                core._hms_short(sx.get("docked_s", 0)), sx.get("docks", 0), sx.get("boots", 0),
+                sx.get("temp_max") if sx.get("temp_max") is not None else "—",
+                " · counters in RAM only (dev jumper)" if sx.get("volatile") else ""))
+        desk = snap.get("desk")
+        if desk is not None and "net" in rows:
+            opt = desk.get("opt") or {}
+            rules = (snap.get("seat") or {}).get("rules") or {}
+            net = []
+            if opt.get("vlan"):
+                net.append("VLAN " + opt["vlan"])
+            if opt.get("mtu"):
+                net.append("MTU " + opt["mtu"])
+            net.append(("address " + opt["addr"]) if opt.get("addr") else "address from the network")
+            rows["net"].set_subtitle(" · ".join(net))
+            dns = opt.get("dns") or "from the network"
+            if opt.get("domain"):
+                dns += " · search " + opt["domain"]
+            rows["dns"].set_subtitle(dns)
+            rows["time"].set_subtitle(" · ".join(x for x in (opt.get("ntp"), opt.get("tz")) if x) or "from the network")
+            rows["proxy"].set_subtitle((opt["proxy"] + (" — in use (your rule)" if rules.get("proxy") else " — not used by this laptop")) if opt.get("proxy") else "none")
+            rows["vpn"].set_subtitle((opt["vpn"] + (" — connected when you dock (your rule)" if rules.get("vpn") else " — not used by this laptop")) if opt.get("vpn") else "none")
+            rows["keys"].set_subtitle("%s" % desk.get("keys", 0))
 
     def _od_set(self, key, value):
         if self.use_service:

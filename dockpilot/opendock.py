@@ -12,6 +12,9 @@ script) a plain Python object to work with. It is also a command-line tool:
     python3 opendock.py set name "Desk 22"      # name | assettag | site
     python3 opendock.py clear                   # hide the log's history
     python3 opendock.py watch                   # print events and status as they happen
+    python3 opendock.py desk                    # the desk the dock holds (firmware 0.6): tag, options, keys
+    python3 opendock.py get proxy               # one desk option or key, bare — for scripts
+    python3 opendock.py export > desk.txt       # the desk as a script; `import desk.txt` sends it back
 
 Needs pyserial (pip install pyserial). Everything else is the standard library.
 
@@ -56,7 +59,14 @@ EVENT_NAMES = {
     "temp_high": "temperature high", "temp_ok": "temperature back to normal",
     "config_change": "setting changed", "time_sync": "clock set", "log_cleared": "log cleared",
     "fault": "firmware fault (carried on)",
+    "desk_change": "desk written", "desk_read": "desk handed to a laptop",
+    "fw_update": "firmware update",
 }
+DESK_CHANGE = {1: "tag", 2: "option", 3: "key", 4: "import", 5: "seat", 6: "seat forgotten"}
+FW_UPDATE = {1: "new firmware written, restarting into it", 2: "new firmware running"}
+OPT_LIMIT = 64
+KEY_LIMIT = 128
+SNAP_LIMIT = 400
 BOOT_REASONS = {0: "unknown", 1: "power on", 2: "brownout", 3: "software reset", 4: "deep-sleep alarm",
                 5: "reset pin", 6: "WATCHDOG — the firmware hung and was reset", 7: "rescue/debug",
                 8: "re-run without reset (console)"}
@@ -102,7 +112,37 @@ def validate_setting(value):
 
 
 def quote(value):
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
+
+
+def unquote(text):
+    """The inverse of quote(): the value in a KEY / SET line as EXPORT prints it."""
+    text = text.strip()
+    if not text.startswith('"'):
+        return text
+    out, i = [], 1
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in '"\\n':
+            out.append("\n" if text[i + 1] == "n" else text[i + 1])
+            i += 2
+            continue
+        if ch == '"':
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def validate_text(value, limit):
+    """Length as the dock counts it (raw and escaped), for a value of `limit` bytes."""
+    if not isinstance(value, str):
+        return "must be text"
+    raw = len(value.encode("utf-8"))
+    escaped = raw + sum(1 for ch in value if ch in '"\\\n')
+    if raw > limit or escaped > limit:
+        return "too long: %d bytes, the dock keeps %d" % (max(raw, escaped), limit)
+    return None
 
 
 def _busy_wait(message):
@@ -146,9 +186,13 @@ def describe(entry):
     elif ev in ("temp_high", "temp_ok"):
         text += " (%s °C)" % v
     elif ev == "config_change":
-        text += " (%s)" % {1: "name", 2: "asset tag", 3: "site"}.get(v, v)
+        text += " (%s)" % {1: "name", 2: "asset tag", 3: "site", 4: "note 1", 5: "note 2", 6: "note 3", 7: "note 4"}.get(v, v)
     elif ev == "fault":
         text += " (%s)" % FAULT_WHERE.get(v, v)
+    elif ev == "desk_change":
+        text += " (%s)" % DESK_CHANGE.get(v, v)
+    elif ev == "fw_update":
+        text += " (%s)" % FW_UPDATE.get(v, v)
     return "%s  #%s  %s" % (format_time(entry), entry.get("i", "?"), text)
 
 
@@ -335,6 +379,31 @@ class Dock:
     def status(self):
         return self.command("STATUS", json_reply=True)
 
+    def has(self, cap):
+        """Does this dock advertise a capability (firmware 0.5 and later)?"""
+        return bool(self.caps and self.caps.get(cap))
+
+    def health(self):
+        """HEALTH: the dock's own verdict, or None on a dock without it."""
+        return self.command("HEALTH", json_reply=True) if self.has("health") else None
+
+    def stats(self):
+        """STATS: lifetime counters, or None on a dock without them."""
+        return self.command("STATS", json_reply=True) if self.has("stats") else None
+
+    def notes(self):
+        """GET NOTES: {"1": text, ...}, or {} on a dock without note slots."""
+        return self.command("GET NOTES", json_reply=True) if self.has("notes") else {}
+
+    def set_note(self, n, value):
+        n = int(n)
+        if not (1 <= n <= int(self.caps.get("notes", 0) if self.caps else 0)):
+            raise DockRefused("badarg", "no note slot %d" % n)
+        why = validate_setting(value)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET NOTE %d %s" % (n, quote(value))) == "OK"
+
     def set(self, field, value):
         """SET NAME / ASSETTAG / SITE. Validates first; raises DockRefused or DockBusy."""
         field = field.lower()
@@ -347,6 +416,125 @@ class Dock:
 
     def clear_log(self):
         return self.command("CLEAR LOG") == "OK"
+
+    # ---- firmware 0.6: the desk lives in the dock
+    def has_desk(self):
+        return bool(self.caps and isinstance(self.caps.get("desk"), dict))
+
+    def _lines(self, cmd, timeout=LOG_TIMEOUT):
+        """A command answered by several lines and END. Returns the lines."""
+        out = []
+        with self._lock:
+            self._drain()
+            self._write(cmd)
+            deadline = time.time() + timeout
+            while True:
+                line = self._next_line(max(0.0, deadline - time.time()))
+                if line is None:
+                    raise DockGone("%s did not finish" % cmd.split(" ", 1)[0])
+                if line == "END":
+                    return out
+                self._check(line, cmd)
+                out.append(line)
+
+    def _json_lines(self, cmd):
+        items = []
+        for line in self._lines(cmd):
+            try:
+                items.append(json.loads(line))
+            except ValueError:
+                continue
+        return items
+
+    def get_desk(self):
+        return self.command("GET DESK", json_reply=True)
+
+    def get_schema(self):
+        return self._json_lines("GET SCHEMA")
+
+    def get_rules(self):
+        return self._json_lines("GET RULES")
+
+    def get_keys(self):
+        """{name: value}"""
+        keys = {}
+        for line in self._lines("GET KEYS"):
+            parts = line.split(" ", 2)
+            if len(parts) == 3 and parts[0] == "KEY":
+                keys[parts[1]] = unquote(parts[2])
+        return keys
+
+    def set_tag(self, value):
+        why = validate_setting(value)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET TAG %s" % quote(value)) == "OK"
+
+    def set_opt(self, oid, value):
+        why = validate_text(value, OPT_LIMIT)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET OPT %s %s" % (oid, quote(value))) == "OK"
+
+    def set_key(self, name, value):
+        why = validate_text(value, KEY_LIMIT)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET KEY %s %s" % (name, quote(value))) == "OK"
+
+    def del_key(self, name):
+        return self.command("DEL KEY %s" % name) == "OK"
+
+    def export(self):
+        """The desk as the SET lines the dock prints (a script you can send back)."""
+        return self._lines("EXPORT")
+
+    def import_lines(self, lines):
+        """Send a saved desk back: IMPORT, the lines, IMPORT END — one write on the dock.
+        Only SET TAG / SET OPT / SET KEY / DEL KEY lines are sent; anything else is skipped."""
+        if self.command("IMPORT") != "OK":
+            return False
+        try:
+            for line in lines:
+                t = line.strip()
+                u = t.upper()
+                if not t or t.startswith("#"):
+                    continue
+                if not (u.startswith("SET TAG ") or u.startswith("SET OPT ") or u.startswith("SET KEY ") or u.startswith("DEL KEY ")):
+                    continue
+                self.command(t, retry_busy=False)
+        except DockError:
+            try:
+                self.command("IMPORT ABORT")
+            except DockError:
+                pass
+            raise
+        return self.command("IMPORT END") == "OK"
+
+    def seat(self, seat_id):
+        return self.command("SEAT %s" % (seat_id or "NONE")) == "OK"
+
+    def get_seat(self):
+        return self.command("GET SEAT", json_reply=True)
+
+    def set_rule(self, rid, on):
+        return self.command("SET RULE %s %d" % (rid, 1 if on else 0)) == "OK"
+
+    def set_cmd(self, when, lines):
+        text = "\n".join(l for l in lines if l.strip())
+        return self.command("SET CMD %s %s" % (when, quote(text))) == "OK"
+
+    def set_snap(self, text):
+        why = validate_text(text, SNAP_LIMIT)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET SNAP %s" % quote(text)) == "OK"
+
+    def set_autosave(self, on):
+        return self.command("SET AUTOSAVE %d" % (1 if on else 0)) == "OK"
+
+    def forget_seat(self):
+        return self.command("FORGET SEAT") == "OK"
 
     def get_log(self, frm=1, mx=None):
         """GET LOG: a list of entry dicts. An abandoned transfer (no END) raises DockGone."""
@@ -370,6 +558,62 @@ class Dock:
 
 
 # --------------------------------------------------------------------------- discovery
+# ---------------------------------------------------------------- firmware files and the web face
+UF2_MAGIC0, UF2_MAGIC1 = 0x0A324655, 0x9E5D5157
+UF2_FAMILY_RP2350_ARM_S, UF2_FAMILY_ABSOLUTE = 0xE48BFF59, 0xE48BFF57
+WEB_HEADER = {"X-OpenDock": "1"}
+
+
+def check_uf2(path):
+    """A firmware file the dock would accept? Returns (ok, message). Only the first block is looked at;
+    the dock checks every block again."""
+    import struct
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            head = f.read(32)
+    except OSError as ex:
+        return False, "couldn't read it: %s" % ex
+    if size == 0 or size % 512 or len(head) < 32:
+        return False, "not a firmware file (.uf2)"
+    m0, m1, flags, addr, blen, no, total, family = struct.unpack("<8I", head)
+    if (m0, m1) != (UF2_MAGIC0, UF2_MAGIC1):
+        return False, "not a firmware file (.uf2)"
+    if family == UF2_FAMILY_ABSOLUTE and addr == 0x10FFFF00 and (flags & 0x8000) and size >= 1024:
+        # picotool's first block in every RP2350 file is an "ignore me" marker; the image starts at block 1
+        with open(path, "rb") as f:
+            f.seek(512)
+            head = f.read(32)
+        m0, m1, flags, addr, blen, no, total, family = struct.unpack("<8I", head)
+    if family == UF2_FAMILY_ABSOLUTE:
+        return False, "that is the installer file, for a dock with no firmware yet; use opendock-dev.uf2 or opendock-carrier.uf2"
+    if family != UF2_FAMILY_RP2350_ARM_S:
+        return False, "that file is not for this dock's chip"
+    return True, "%d blocks, %d KB" % (total, size // 1024)
+
+
+def update_firmware(web, path, timeout=180):
+    """POST a .uf2 to the dock's web face (web = the CAPS "web" dict). Returns the dock's reply line;
+    raises DockRefused with the dock's reason, DockGone when nothing answered."""
+    import urllib.error
+    import urllib.request
+    url = "http://%s/update" % (web.get("ip") or web.get("host"))
+    with open(path, "rb") as f:
+        body = f.read()
+    req = urllib.request.Request(url, data=body, method="POST", headers=dict(WEB_HEADER, **{"Content-Type": "application/octet-stream"}))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            line = r.read().decode("utf-8", "replace").strip()
+    except urllib.error.HTTPError as e:
+        line = e.read().decode("utf-8", "replace").strip()
+    except Exception as ex:
+        raise DockGone("the dock's page did not answer at %s (%s)" % (url, ex))
+    if not line.startswith("OK"):
+        m = re.match(r"^ERR (\S+) ?(.*)$", line)
+        raise DockRefused(m.group(1) if m else "http", (m.group(2) if m else line) or "the dock refused the file")
+    return line
+
+
 def find_docks(on_progress=None):
     """Every port that answers IDENTIFY with the signature. Returns a list of
     (port, identity) — identity is the dict Dock.identify() returns. Ports that
@@ -477,14 +721,24 @@ class DockLink:
 
     RESCAN_S = 5.0
 
-    def __init__(self, config_dir, on_connect=None, on_disconnect=None, on_event=None, on_log=None):
+    def __init__(self, config_dir, on_connect=None, on_disconnect=None, on_event=None, on_log=None, seat_id=None):
         self.config_dir = config_dir
         self.on_connect, self.on_disconnect = on_connect, on_disconnect
         self.on_event, self.on_log = on_event, on_log
+        self.seat_id = seat_id           # 16 hex chars this laptop derives from its key, or None
         self.dock = None
         self.store = None
         self.port = None
         self.status = {}
+        self.health = None
+        self.stats = None
+        self.notes = {}
+        self.desk = None                 # GET DESK, on a dock that has one
+        self.schema = []                 # GET SCHEMA
+        self.rules = []                  # GET RULES
+        self.keys = {}                   # GET KEYS
+        self.seat = None                 # GET SEAT
+        self._polls = 0
         self.error = ""
         self._last_scan = 0.0
         self._lock = threading.Lock()
@@ -502,6 +756,14 @@ class DockLink:
                 "identity": dict(self.dock.identity) if self.dock else None,
                 "caps": dict(self.dock.caps) if self.dock and self.dock.caps else None,
                 "status": dict(self.status),
+                "health": dict(self.health) if self.health else None,
+                "stats": dict(self.stats) if self.stats else None,
+                "notes": dict(self.notes),
+                "desk": dict(self.desk) if self.desk else None,
+                "schema": list(self.schema),
+                "rules": list(self.rules),
+                "keys": dict(self.keys),
+                "seat": dict(self.seat) if self.seat else None,
                 "events": list(self.dock.last_events) if self.dock else [],
                 "log": list(self.store.entries[-200:]) if self.store else [],
                 "log_count": len(self.store.entries) if self.store else 0,
@@ -542,17 +804,53 @@ class DockLink:
                 self.error = str(e)
             return
         store = LogStore(self.config_dir, d.identity["uid"])
+        try:
+            h, sx, notes = d.health(), d.stats(), d.notes()
+        except DockError:
+            h, sx, notes = None, None, {}
         with self._lock:
             self.dock, self.port, self.store, self.error = d, port, store, ""
+            self.health, self.stats, self.notes, self._polls = h, sx, notes or {}, 0
+            self.desk, self.schema, self.rules, self.keys, self.seat = None, [], [], {}, None
+        self._load_desk(full=True)
         if self.on_connect:
             self.on_connect(self)
         self._refresh()
 
+    def _load_desk(self, full=False):
+        """What the dock holds (firmware 0.6): the desk, and this laptop's seat."""
+        d = self.dock
+        if d is None or not d.has_desk():
+            return
+        try:
+            if full:
+                schema, rules = d.get_schema(), d.get_rules()
+                if self.seat_id:
+                    d.seat(self.seat_id)
+            desk, keys = d.get_desk(), d.get_keys()
+            seat = d.get_seat() if self.seat_id else None
+        except DockError:
+            return
+        with self._lock:
+            if full:
+                self.schema, self.rules = schema, rules
+            self.desk, self.keys, self.seat = desk, keys, seat
+
     def _refresh(self):
         try:
             st = self.dock.status()
+            self._polls += 1
+            h = sx = None
+            if self._polls % 5 == 1:                      # every ~10 s: cheap, and nothing to write
+                h, sx = self.dock.health(), self.dock.stats()
+            if self._polls % 15 == 2:                     # every ~30 s: another laptop may have written
+                self._load_desk()
             with self._lock:
                 self.status = st
+                if h is not None:
+                    self.health = h
+                if sx is not None:
+                    self.stats = sx
             new = self.store.collect(self.dock, st)
             if new and self.on_log:
                 self.on_log(new)
@@ -563,6 +861,8 @@ class DockLink:
         d = self.dock
         with self._lock:
             self.dock, self.port, self.status, self.error = None, None, {}, why
+            self.health, self.stats, self.notes = None, None, {}
+            self.desk, self.schema, self.rules, self.keys, self.seat = None, [], [], {}, None
         if d is not None:
             d.close()
         if self.on_disconnect:
@@ -578,7 +878,22 @@ class DockLink:
     def set(self, field, value):
         if self.dock is None:
             raise DockGone("no dock connected")
-        ok = self.dock.set(field, value)
+        if field.startswith("note") and field[4:].isdigit():
+            ok = self.dock.set_note(int(field[4:]), value)
+            notes = self.dock.notes()
+            with self._lock:
+                self.notes = notes or {}
+        else:
+            ok = self.dock.set(field, value)
+        self._refresh()
+        return ok
+
+    def desk_action(self, name, *args):
+        """One of the Dock's desk calls by name, then re-read what the dock holds."""
+        if self.dock is None:
+            raise DockGone("no dock connected")
+        ok = getattr(self.dock, name)(*args)
+        self._load_desk()
         self._refresh()
         return ok
 
@@ -610,19 +925,28 @@ def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser(description="Talk to an OpenDock over the DockPilot Dock Protocol v1.")
     ap.add_argument("--port", help="serial port (default: find it)")
-    ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config"),
-                    help="where the log copy is kept")
+    ap.add_argument("--config", default=os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config"), "dockpilot"),
+                    help="where the log copy is kept (the same folder DockPilot uses)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="every dock on this machine")
     sub.add_parser("status", help="STATUS as JSON")
     p = sub.add_parser("log", help="new log entries (or --all)")
     p.add_argument("--all", action="store_true", help="everything the dock holds, not just what is new")
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("set", help="set name, assettag or site")
-    p.add_argument("field", choices=FIELDS)
-    p.add_argument("value")
+    p = sub.add_parser("set", help="set name, assettag or site — or a key: `set room 4.12` (firmware 0.6)")
+    p.add_argument("field", help="name, assettag, site, or a key name (a-z, 0-9, _)")
+    p.add_argument("value", help="the value; an empty value removes a key")
+    p = sub.add_parser("del", help="remove a key")
+    p.add_argument("name")
+    sub.add_parser("keys", help="every key the dock holds, name=value per line")
     sub.add_parser("clear", help="CLEAR LOG")
     sub.add_parser("watch", help="print events and a status line as they happen")
+    sub.add_parser("desk", help="the desk the dock holds: tag, options, keys (firmware 0.6)")
+    p = sub.add_parser("get", help="one desk option or key, printed bare (empty if unset)")
+    p.add_argument("name")
+    sub.add_parser("export", help="the desk as SET lines, to stdout")
+    p = sub.add_parser("import", help="send a saved desk back (one write on the dock)")
+    p.add_argument("file")
     args = ap.parse_args(argv)
 
     if serial is None:
@@ -650,10 +974,21 @@ def main(argv=None):
                     print("nothing new since index %d" % store.last_seen)
             for e in entries:
                 print(json.dumps(e) if args.json else describe(e))
-        elif args.cmd == "set":
+        elif args.cmd in ("set", "del", "keys"):
             try:
-                d.set(args.field, args.value)
-                print("OK")
+                if args.cmd == "set" and args.field in FIELDS:
+                    d.set(args.field, args.value)
+                    print("OK")
+                else:
+                    if not d.has_desk():
+                        sys.exit("this dock's firmware (%s) has no keys; 0.6 or later does" % d.identity["fw"])
+                    if args.cmd == "keys":
+                        for k, v in sorted(d.get_keys().items()):
+                            print("%s=%s" % (k, v))
+                    elif args.cmd == "del" or args.value == "":
+                        print("OK" if d.del_key(args.name if args.cmd == "del" else args.field) else "failed")
+                    else:
+                        print("OK" if d.set_key(args.field, args.value) else "failed")
             except DockRefused as e:
                 sys.exit("refused: %s" % e.message)
             except DockBusy as e:
@@ -662,6 +997,37 @@ def main(argv=None):
             d.clear_log()
             LogStore(args.config, d.identity["uid"]).forget()
             print("OK")
+        elif args.cmd in ("desk", "get", "export", "import"):
+            if not d.has_desk():
+                sys.exit("this dock's firmware (%s) has no desk; 0.6 or later does" % d.identity["fw"])
+            if args.cmd == "desk":
+                desk = d.get_desk()
+                print("tag:", desk.get("tag", ""))
+                for o in d.get_schema():
+                    print("%-14s %s" % (o["label"] + ":", desk["opt"].get(o["id"], "")))
+                for k, v in sorted(d.get_keys().items()):
+                    print("%-14s %s" % (k + ":", v))
+            elif args.cmd == "get":
+                desk = d.get_desk()
+                name = args.name.lower()
+                if name == "tag":
+                    print(desk.get("tag", ""))
+                elif name in desk.get("opt", {}):
+                    print(desk["opt"][name])
+                else:
+                    print(d.get_keys().get(name, ""))
+            elif args.cmd == "export":
+                for line in d.export():
+                    print(line)
+            else:
+                with open(args.file) as f:
+                    lines = f.read().splitlines()
+                try:
+                    print("OK" if d.import_lines(lines) else "failed")
+                except DockRefused as e:
+                    sys.exit("refused: %s" % e.message)
+                except DockBusy as e:
+                    sys.exit("busy: %s" % e)
         elif args.cmd == "watch":
             d.on_event = lambda t: print(time.strftime("%H:%M:%S"), "EVENT", t, flush=True)
             print("watching %s (%s) — Ctrl-C to stop" % (d.identity["serial"], d.port))

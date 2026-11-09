@@ -1,0 +1,3 @@
+#!/bin/sh
+# opendock: the command line for a dock — list | status | desk | get <name> | export | import <file> | log | watch
+exec /usr/bin/python3 /usr/lib/dockpilot/opendock.py "$@"

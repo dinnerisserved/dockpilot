@@ -27,3 +27,8 @@ build/
 dist/
 *.egg-info/
 pip_build/
+
+# the built installables sit next to the source in a release unzip; never commit them
+*.deb
+*.whl
+*.tar.gz

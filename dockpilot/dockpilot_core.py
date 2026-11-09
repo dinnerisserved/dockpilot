@@ -12,6 +12,7 @@ with no window open, keeps the OpenDock link, writes ~/.cache/dockpilot/status.j
 top-bar tile, and answers the window on a Unix socket, one JSON object per line.
 """
 
+import glob
 import os
 import re
 import sys
@@ -37,7 +38,8 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 #  config — beside the script only
 # --------------------------------------------------------------------------- #
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2"
+WEBSITE = "opendocktech.com"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 def _pick_config_dir():
@@ -67,6 +69,8 @@ DEVICES_FILE = os.path.join(CONFIG_DIR, "devices.json")
 STATE_FILE = os.path.join(CONFIG_DIR, "dock_state.json")
 AUTOMATION_FILE = os.path.join(CONFIG_DIR, "automation.json")
 DOCKMEM_FILE = os.path.join(CONFIG_DIR, "dock_memory.json")
+SEAT_FILE = os.path.join(CONFIG_DIR, "seat_key")          # this laptop's seat key: six words
+DESK_STATE_FILE = os.path.join(CONFIG_DIR, "desk_applied.json")   # what was applied, to undo at undock
 
 def load_json(path, default):
     try:
@@ -213,8 +217,17 @@ def iface_is_usb(name):
 def iface_is_wifi(name):
     return os.path.exists(f"/sys/class/net/{name}/wireless") or name.startswith(("wl", "wlan", "wlp"))
 
+OPENDOCK_LINK_MAC = "02:0d:0c"     # the dock's own management link (firmware 1.0, CDC-NCM): not a dock NIC
+
+
+def iface_is_opendock_link(name):
+    """The OpenDock management board's network link, which serves http://opendock.local. It is
+    a USB network interface too, but it is the dock talking, not the dock's Ethernet chip."""
+    return net_mac(name).startswith(OPENDOCK_LINK_MAC)
+
+
 def usb_eth_ifaces():
-    return [n for n in list_ifaces() if iface_is_usb(n)]
+    return [n for n in list_ifaces() if iface_is_usb(n) and not iface_is_opendock_link(n)]
 
 def in_dialout_group():
     """Serial/dock access needs the user in the 'dialout' group on most distros."""
@@ -951,6 +964,421 @@ def run_macros(store, trigger, log=None, dock_model="", **env_extra):
     return fired
 
 
+
+# --------------------------------------------------------------------------- #
+#  The seat — this laptop at an OpenDock (firmware 0.6)
+#
+#  The dock holds the desk (tag, options, keys) and, per laptop, a seat: rules,
+#  own commands, a saved configuration. DockPilot is a client: it reads what the
+#  dock hands out and does the laptop-side work. The seat is filed in the dock
+#  under an id derived from a secret the laptop keeps (six words); the dock never
+#  sees the words, so it never learns who docked. Give the words to another
+#  laptop and it is the same seat at every dock.
+# --------------------------------------------------------------------------- #
+SEAT_WORDS = (
+    "acorn amber anchor apple arrow aspen atlas autumn badger bamboo barley basil beacon berry birch "
+    "bison blossom bolt bonfire breeze bridge brook butter cabin cactus camel candle canyon carbon "
+    "castle cedar cello chalk cherry cider cinder clover cobalt cocoa comet copper coral cotton cradle "
+    "crane cricket crystal cumin daisy dawn delta denim desert dune eagle ember engine falcon feather "
+    "fennel fern fiddle finch flame flint forest fossil garden garnet ginger glacier goose granite "
+    "gravel hammer harbor harvest hazel heron honey hornet iceberg indigo iris island ivory jade jasper "
+    "jungle juniper kettle kiwi lagoon lantern lava lemon lily linen lobster locust lotus lumber magnet "
+    "mango maple marble meadow melon meteor mint mirror mocha moss moth muffin nickel noodle nutmeg "
+    "oasis ocean olive onyx orbit orchid otter oyster panda paper parrot pebble pepper pine plum poppy "
+    "prairie pumpkin quartz quiver rabbit radar raven reef ribbon river rocket rose ruby saddle saffron "
+    "salmon sandal sapphire scarf shadow silk silver sketch slate smoke sparrow spider spruce squid "
+    "stone storm sugar summer sunset swan tango thistle thunder tiger timber topaz torch tulip tundra "
+    "turtle umbrella valley vanilla velvet violet walnut walrus wheat willow winter wolf yarrow zebra "
+    "zinc seven tide cloud north south east west gold iron oak elm ash yew bay fig alder anvil apron "
+    "arch attic aurora avocado bagel ballad banjo barn basin bead beetle bell belt biscuit blanket bluff "
+    "boat boot bottle bow brick broom bucket bugle bulb bun burrow cable cake camera canal cane canoe "
+    "cape card cargo carrot cart cave chair chapel chess chime chip clay "
+).split()
+assert len(SEAT_WORDS) >= 256
+SEAT_WORDS = SEAT_WORDS[:256]
+SEAT_LEN = 6
+
+
+def seat_phrase_new():
+    """Six random words, e.g. copper-lantern-orbit-seven-maple-tide."""
+    import secrets
+    return "-".join(secrets.choice(SEAT_WORDS) for _ in range(SEAT_LEN))
+
+
+def seat_phrase_clean(text):
+    """A phrase as typed: words in any case, separated by spaces or dashes.
+    Returns the canonical phrase or None if it is not one."""
+    words = [w for w in re.split(r"[\s\-_,]+", (text or "").strip().lower()) if w]
+    if len(words) != SEAT_LEN or any(w not in SEAT_WORDS for w in words):
+        return None
+    return "-".join(words)
+
+
+def seat_id(phrase):
+    """The 16 hex characters the dock files the seat under. A slow hash, so the
+    id on the dock cannot be turned back into the words in any useful time."""
+    import hashlib
+    return hashlib.pbkdf2_hmac("sha256", phrase.encode("utf-8"), b"opendock-seat", 200000)[:8].hex()
+
+
+def seat_load(path=None):
+    """This laptop's phrase, made on first use and kept with owner-only permissions."""
+    path = path or SEAT_FILE
+    try:
+        with open(path) as f:
+            ph = seat_phrase_clean(f.read())
+        if ph:
+            return ph
+    except Exception:
+        pass
+    ph = seat_phrase_new()
+    seat_save(ph, path)
+    return ph
+
+
+def seat_save(phrase, path=None):
+    path = path or SEAT_FILE
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(phrase + "\n")
+        return True
+    except Exception:
+        return False
+
+
+# What the laptop does with each rule the dock knows. Unknown rule ids (a newer dock)
+# are shown by the app and ignored here. (tool needed, or None)
+RULE_TOOLS = {"wifi_off": "nmcli", "audio_dock": "pactl", "lock_undock": "loginctl", "mute_undock": "pactl",
+              "touchpad_off": "gsettings", "vpn": "nmcli", "proxy": "gsettings", "tile": None}
+# Desk options this laptop can apply, and what it needs. The rest (ntp) is kept by the dock and shown.
+OPT_TOOLS = {"vlan": "nmcli", "mtu": "nmcli", "addr": "nmcli", "dns": "nmcli", "domain": "nmcli",
+             "tz": "timedatectl", "proxy": "gsettings", "vpn": "nmcli"}
+
+
+def desk_plan(desk, seat, connected, iface, have_fn=None):
+    """What to run for this desk and seat, as a list of (note, argv-or-shell) steps.
+    Pure: no side effects, so it can be tested. `have_fn` says which tools exist.
+    Returns (steps, applied, skipped) — applied/skipped are option ids, for the log line."""
+    have_fn = have_fn or have
+    opt = (desk or {}).get("opt") or {}
+    rules = (seat or {}).get("rules") or {}
+    steps, applied, skipped = [], [], []
+
+    def nm_con():
+        return 'c=$(nmcli -g GENERAL.CONNECTION device show "%s" 2>/dev/null); [ -n "$c" ]' % iface
+
+    # -- desk options: in force while docked, undone at undock
+    if opt.get("vlan"):
+        if have_fn("nmcli") and iface:
+            name = "opendock-vlan-%s" % opt["vlan"]
+            if connected:
+                steps.append(("VLAN %s on %s" % (opt["vlan"], iface),
+                              'nmcli connection add type vlan con-name "%s" ifname "%s.%s" dev "%s" id %s >/dev/null 2>&1; nmcli connection up "%s"'
+                              % (name, iface, opt["vlan"], iface, opt["vlan"], name)))
+            else:
+                steps.append(("VLAN removed", 'nmcli connection delete "%s" 2>/dev/null || true' % name))
+            applied.append("vlan")
+        else:
+            skipped.append("vlan")
+    if opt.get("mtu"):
+        if have_fn("nmcli") and iface:
+            steps.append(("MTU %s" % opt["mtu"] if connected else "MTU back to automatic",
+                          nm_con() + ' && nmcli con mod "$c" 802-3-ethernet.mtu %s && nmcli con up "$c" >/dev/null' % (opt["mtu"] if connected else 0)))
+            applied.append("mtu")
+        else:
+            skipped.append("mtu")
+    if opt.get("addr"):
+        if have_fn("nmcli") and iface:
+            parts = opt["addr"].split()
+            ip, gw = parts[0], (parts[1] if len(parts) > 1 else "")
+            if connected:
+                steps.append(("fixed address %s" % ip,
+                              nm_con() + ' && nmcli con mod "$c" ipv4.method manual ipv4.addresses "%s" ipv4.gateway "%s" && nmcli con up "$c" >/dev/null' % (ip, gw)))
+            else:
+                steps.append(("address from the network again",
+                              nm_con() + ' && nmcli con mod "$c" ipv4.method auto ipv4.addresses "" ipv4.gateway "" && nmcli con up "$c" >/dev/null'))
+            applied.append("addr")
+        else:
+            skipped.append("addr")
+    if opt.get("dns") or opt.get("domain"):
+        if have_fn("nmcli") and iface:
+            dns = opt.get("dns", "").replace(",", " ")
+            if connected:
+                steps.append(("DNS %s%s" % (dns, (" search " + opt["domain"]) if opt.get("domain") else ""),
+                              nm_con() + ' && nmcli con mod "$c" ipv4.dns "%s" ipv4.dns-search "%s" ipv4.ignore-auto-dns %s && nmcli con up "$c" >/dev/null'
+                              % (dns, opt.get("domain", ""), "yes" if dns else "no")))
+            else:
+                steps.append(("DNS from the network again",
+                              nm_con() + ' && nmcli con mod "$c" ipv4.dns "" ipv4.dns-search "" ipv4.ignore-auto-dns no && nmcli con up "$c" >/dev/null'))
+            applied.append("dns")
+        else:
+            skipped.append("dns")
+    if opt.get("tz"):
+        if have_fn("timedatectl"):
+            if connected:
+                steps.append(("time zone %s" % opt["tz"],
+                              'mkdir -p "$HOME/.cache/dockpilot"; timedatectl show -p Timezone --value > "$HOME/.cache/dockpilot/tz.prev"; timedatectl set-timezone "%s"' % opt["tz"]))
+            else:
+                steps.append(("time zone back", '[ -s "$HOME/.cache/dockpilot/tz.prev" ] && timedatectl set-timezone "$(cat "$HOME/.cache/dockpilot/tz.prev")"'))
+            applied.append("tz")
+        else:
+            skipped.append("tz")
+    if opt.get("ntp"):
+        skipped.append("ntp")                      # kept by the dock, shown; setting it needs root
+    # proxy and vpn are desk options the seat chooses to use, by rule
+    if rules.get("proxy") and opt.get("proxy"):
+        if have_fn("gsettings"):
+            host, _, port = opt["proxy"].rpartition(":")
+            if not host:
+                host, port = port, "3128"
+            host = host.replace("http://", "").replace("https://", "")
+            if connected:
+                steps.append(("proxy %s" % opt["proxy"],
+                              'gsettings set org.gnome.system.proxy.http host "%s"; gsettings set org.gnome.system.proxy.http port %s; '
+                              'gsettings set org.gnome.system.proxy.https host "%s"; gsettings set org.gnome.system.proxy.https port %s; '
+                              'gsettings set org.gnome.system.proxy mode manual' % (host, port, host, port)))
+            else:
+                steps.append(("proxy off", "gsettings set org.gnome.system.proxy mode none"))
+            applied.append("proxy")
+        else:
+            skipped.append("proxy")
+    if rules.get("vpn") and opt.get("vpn"):
+        if have_fn("nmcli"):
+            v = opt["vpn"]
+            find = ('n=$(nmcli -t -f NAME,TYPE connection show | awk -F: \'$2=="vpn"||$2=="wireguard"{print $1}\' | grep -Fx "%s" | head -1); '
+                    '[ -z "$n" ] && n=$(for x in $(nmcli -t -f NAME,TYPE connection show | awk -F: \'$2=="vpn"||$2=="wireguard"{print $1}\'); do '
+                    'nmcli -g vpn.data connection show "$x" 2>/dev/null | grep -q "%s" && echo "$x" && break; done); [ -n "$n" ]' % (v, v))
+            steps.append(("VPN %s" % v if connected else "VPN down",
+                          find + (' && nmcli connection up "$n"' if connected else ' && nmcli connection down "$n" 2>/dev/null || true')))
+            applied.append("vpn")
+        else:
+            skipped.append("vpn")
+    # -- rules that are not about an option
+    if rules.get("wifi_off"):
+        if have_fn("nmcli"):
+            steps.append(("Wi-Fi %s" % ("off" if connected else "on"), ["nmcli", "radio", "wifi", "off" if connected else "on"]))
+    if rules.get("audio_dock") and connected and have_fn("pactl"):
+        steps.append(("sound through the dock", 'for s in $(pactl list short sinks | cut -f2); do case "$s" in *usb*|*USB*) pactl set-default-sink "$s"; break;; esac; done'))
+    if rules.get("lock_undock") and not connected and have_fn("loginctl"):
+        steps.append(("lock the screen", ["loginctl", "lock-session"]))
+    if rules.get("mute_undock") and not connected and have_fn("pactl"):
+        steps.append(("mute", ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"]))
+    if rules.get("touchpad_off") and have_fn("gsettings"):
+        steps.append(("touchpad %s" % ("off" if connected else "on"),
+                      ["gsettings", "set", "org.gnome.desktop.peripherals.touchpad", "send-events", "disabled" if connected else "enabled"]))
+    return steps, applied, skipped
+
+
+def take_snapshot():
+    """How the laptop is set up right now, as the dock will keep it (under 400 bytes):
+    screens, sound in and out, volume, keyboard layout, VPNs that are up."""
+    snap = {}
+    try:
+        n = 0
+        for c in glob.glob("/sys/class/drm/card*-*/status"):
+            if read_sys(c) == "connected":
+                n += 1
+        if n:
+            snap["screens"] = n
+    except Exception:
+        pass
+    if have("pactl"):
+        rc, out = run(["pactl", "get-default-sink"], timeout=5)
+        if rc == 0 and out.strip():
+            snap["sink"] = out.strip()[:60]
+        rc, out = run(["pactl", "get-default-source"], timeout=5)
+        if rc == 0 and out.strip():
+            snap["source"] = out.strip()[:60]
+        rc, out = run(["pactl", "get-sink-volume", "@DEFAULT_SINK@"], timeout=5)
+        m = re.search(r"(\d+)%", out) if rc == 0 else None
+        if m:
+            snap["volume"] = int(m.group(1))
+    if have("gsettings"):
+        rc, out = run(["gsettings", "get", "org.gnome.desktop.input-sources", "sources"], timeout=5)
+        m = re.search(r"\('xkb',\s*'([^']+)'\)", out) if rc == 0 else None
+        if m:
+            snap["keyboard"] = m.group(1)[:20]
+    if have("nmcli"):
+        rc, out = run(["nmcli", "-t", "-f", "NAME,TYPE,STATE", "connection", "show", "--active"], timeout=5)
+        vpns = [l.split(":")[0] for l in out.splitlines() if rc == 0 and l.count(":") >= 2 and l.split(":")[1] in ("vpn", "wireguard")]
+        if vpns:
+            snap["vpn"] = vpns[:2]
+    text = json.dumps(snap, separators=(",", ":"))
+    while len(text.encode("utf-8")) > 390 and snap:
+        snap.pop(sorted(snap)[-1])
+        text = json.dumps(snap, separators=(",", ":"))
+    return text
+
+
+def snapshot_words(text):
+    """One line describing a saved configuration."""
+    try:
+        d = json.loads(text) if text else {}
+    except ValueError:
+        return "unreadable"
+    if not d:
+        return "nothing saved yet"
+    bits = []
+    if "screens" in d:
+        bits.append("%d screen%s" % (d["screens"], "" if d["screens"] == 1 else "s"))
+    if "sink" in d:
+        bits.append("sound: " + ("dock" if "usb" in d["sink"].lower() else d["sink"].split(".")[-1][:18]))
+    if "volume" in d:
+        bits.append("%d %%" % d["volume"])
+    if "keyboard" in d:
+        bits.append("keyboard: " + d["keyboard"])
+    if "vpn" in d:
+        bits.append("VPN: " + ", ".join(d["vpn"]))
+    return " · ".join(bits) or "saved"
+
+
+def restore_plan(text, have_fn=None):
+    """Steps that put a saved configuration back: sound, volume, keyboard, VPN.
+    Screens are what the desk has; nothing to set."""
+    have_fn = have_fn or have
+    try:
+        d = json.loads(text) if text else {}
+    except ValueError:
+        return []
+    steps = []
+    if have_fn("pactl"):
+        if d.get("sink"):
+            steps.append(("sound output", ["pactl", "set-default-sink", d["sink"]]))
+        if d.get("source"):
+            steps.append(("sound input", ["pactl", "set-default-source", d["source"]]))
+        if "volume" in d:
+            steps.append(("volume %d %%" % d["volume"], ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "%d%%" % int(d["volume"])]))
+    if have_fn("gsettings") and d.get("keyboard"):
+        steps.append(("keyboard %s" % d["keyboard"], ["gsettings", "set", "org.gnome.desktop.input-sources", "sources", "[('xkb', '%s')]" % d["keyboard"]]))
+    if have_fn("nmcli"):
+        for v in d.get("vpn", []):
+            steps.append(("VPN %s" % v, ["nmcli", "connection", "up", v]))
+    return steps
+
+
+# --------------------------------------------------------------------------- #
+#  Dock usage — the dock's own log turned into "when was this desk in use"
+# --------------------------------------------------------------------------- #
+def dock_usage(entries, days=14, now=None, docked_now=None, docked_s=0):
+    """From the host's copy of a dock's log: per-day docked seconds for the last
+    `days` days (oldest first), total sessions, and the last time it was used.
+    Only timestamped (clock-synced) entries count; an unsynced boot is a gap.
+    If the dock says it is docked right now for docked_s, that open session is
+    counted up to now."""
+    now = int(now if now is not None else time.time())
+    day_start = now - (now % 86400)
+    first_day = day_start - 86400 * (days - 1)
+    per_day = [0] * days
+    sessions = 0
+    last_used = None
+    start = None
+
+    def add(a, b):
+        a, b = max(a, first_day), min(b, now)
+        while a < b:
+            d = (a - first_day) // 86400
+            if 0 <= d < days:
+                end = min(b, first_day + 86400 * (d + 1))
+                per_day[d] += end - a
+                a = end
+            else:
+                break
+    for e in sorted(entries, key=lambda e: e.get("i", 0)):
+        t = e.get("t")
+        ev = e.get("ev")
+        if not t:
+            if ev == "boot":
+                start = None                      # power was lost; the session ended unseen
+            continue
+        if ev == "dock":
+            start = t
+            sessions += 1
+            last_used = max(last_used or 0, t)
+        elif ev in ("undock", "boot"):
+            if start is not None and t > start:
+                add(start, t)
+                last_used = max(last_used or 0, t)
+            start = None
+    if docked_now and docked_s:
+        s0 = now - int(docked_s)
+        if start is None:                         # the dock event was before the clock was set
+            start = s0
+            sessions += 1
+    if start is not None:
+        add(start, now)                           # the session is still open
+        last_used = now
+    return {"per_day": per_day, "day0": first_day, "sessions": sessions, "last_used": last_used,
+            "today_s": per_day[-1], "week_s": sum(per_day[-7:])}
+
+
+def health_words(h):
+    """One line from a HEALTH reply."""
+    if not h:
+        return "—"
+    if h.get("ok"):
+        return "OK — %s faults, log intact, %s writes left, clock %s" % (
+            h.get("faults", {}).get("since_boot", 0), h.get("flash", {}).get("writes_left", "?"), h.get("clock", "?"))
+    why = []
+    f = h.get("faults") or {}
+    if f.get("since_boot"):
+        why.append("%d fault%s since boot (last: %s)" % (f["since_boot"], "" if f["since_boot"] == 1 else "s", f.get("last") or "?"))
+    lg = h.get("log") or {}
+    if lg.get("recreated"):
+        why.append("log file rebuilt")
+    if lg.get("skipped"):
+        why.append("log lost a block to a power cut")
+    fl = h.get("flash") or {}
+    if fl.get("writes_left") == 0:
+        why.append("write budget spent")
+    if (h.get("temp") or {}).get("high_events") and h.get("temp", {}).get("now", 0) and h["temp"]["now"] >= 55:
+        why.append("running hot")
+    if h.get("reset") in ("watchdog", "brownout"):
+        why.append("last reset was a %s" % h["reset"])
+    return "Needs a look — " + "; ".join(why) if why else "Needs a look"
+
+
+def _hms_short(sec):
+    sec = int(sec or 0)
+    if sec < 60:
+        return "%ds" % sec
+    if sec < 3600:
+        return "%dm" % (sec // 60)
+    return "%dh %02dm" % (sec // 3600, (sec % 3600) // 60)
+
+
+# --------------------------------------------------------------------------- #
+#  What the dock reports to IT — one document, stable field names
+# --------------------------------------------------------------------------- #
+def dock_report(snap, host=None):
+    """The inventory record for one OpenDock, from its snapshot. Keys are fixed;
+    a field a dock cannot provide is null, never missing."""
+    ident, st = snap.get("identity") or {}, snap.get("status") or {}
+    caps = snap.get("caps") or {}
+    desk = snap.get("desk") or {}
+    return {
+        "schema": "opendock-report/2",
+        "serial": ident.get("serial"), "chip_id": ident.get("uid"), "model": ident.get("model"),
+        "firmware": ident.get("fw"), "protocol": ident.get("proto"),
+        "tag": st.get("name") or None,
+        "options": {k: v for k, v in (desk.get("opt") or {}).items() if v} if desk else None,
+        "keys": desk.get("keys") if desk else None, "seats": desk.get("seats") if desk else None,
+        "docked": st.get("docked"), "docked_s": st.get("docked_s"),
+        "temp_c": st.get("temp_c"), "vbus_v": st.get("vbus_v"),
+        "uptime_s": st.get("uptime_s"), "clock_synced": st.get("time_synced"),
+        "log_entries": st.get("log_entries"), "log_volatile": st.get("log_volatile"),
+        "health": snap.get("health"), "stats": snap.get("stats"),
+        "capabilities": sorted(k for k, v in caps.items() if v is True) if caps else None,
+        "seen_by": host or platform.node(), "seen_at": int(time.time()),
+    }
+
+
+def report_key(rep):
+    """The part of a report that means 'something changed' — not the clocks."""
+    return tuple(json.dumps(rep.get(k), sort_keys=True) for k in ("serial", "firmware", "tag", "options", "keys", "seats", "docked",
+                                                                 "clock_synced", "log_volatile", "health"))
+
 # --------------------------------------------------------------------------- #
 #  GUI page
 # --------------------------------------------------------------------------- #
@@ -1287,6 +1715,10 @@ class Engine:
         self.privshell = PrivShell()
         self.automation = automation
         self.rules = self._load_rules()
+        self.seat_phrase = seat_load()
+        self.seat_id = seat_id(self.seat_phrase)
+        self.desk_applied = load_json(DESK_STATE_FILE, None)   # the desk/seat in force, to undo at undock
+        self.last_report_key = None
         self._rules_mtime = self._file_mtime(AUTOMATION_FILE)
         self.reach = {}
         self._timers = []                       # (due, fn) — fired from tick()
@@ -1353,13 +1785,145 @@ class Engine:
         self._rules_mtime = self._file_mtime(AUTOMATION_FILE)
 
     def reload_rules_if_changed(self):
+        changed = False
         m = self._file_mtime(AUTOMATION_FILE)
         if m != self._rules_mtime:
             self._rules_mtime = m
             self.rules = self._load_rules()
             self.macro_store.load()
+            changed = True
+        return changed
+
+    # ---- the desk and the seat (what the dock hands out) --------------------------------
+    def od_serial(self):
+        return ((self.od_snap or {}).get("identity") or {}).get("serial") or ""
+
+    def od_desk(self):
+        return (self.od_snap or {}).get("desk")
+
+    def od_seat(self):
+        return (self.od_snap or {}).get("seat")
+
+    def apply_desk(self, connected, desk=None, seat=None):
+        """Do the laptop-side work for the desk the dock handed out and this
+        laptop's seat. Only when this engine owns automation. Undo at undock uses
+        what was applied at dock, kept in a file so a restart still undoes it."""
+        if connected:
+            desk = desk if desk is not None else self.od_desk()
+            seat = seat if seat is not None else self.od_seat()
+            if desk is None:
+                return False
+            self.desk_applied = {"desk": desk, "seat": seat, "serial": self.od_serial()}
+            save_json(DESK_STATE_FILE, self.desk_applied)
+        else:
+            if not self.desk_applied:
+                return False
+            desk, seat = self.desk_applied.get("desk"), self.desk_applied.get("seat")
+            self.desk_applied = None
+            try:
+                os.remove(DESK_STATE_FILE)
+            except OSError:
+                pass
+        steps, applied, skipped = desk_plan(desk, seat, connected, self.iface)
+        n_opt = len([k for k, v in ((desk or {}).get("opt") or {}).items() if v])
+        self.log("# desk %s: %s — %d of %d options %s%s" % (
+            (desk or {}).get("tag") or self.od_serial(), "dock" if connected else "undock",
+            len(applied), n_opt, "applied" if connected else "undone",
+            (" (not here: %s)" % ", ".join(skipped)) if skipped else ""))
+        env = self.od_env()
+        env["DOCK_IFACE"] = self.iface or ""
+        shell = []
+        for note, step in steps:
+            if isinstance(step, list):
+                self.do(step, note=note)
+            else:
+                self.log("# " + note)
+                shell.append(step)
+        if shell:
+            run_commands(shell, log=self.log, env_extra=env)
+        cmds = ((seat or {}).get("cmd") or {}).get("dock" if connected else "undock") or []
+        if cmds:
+            self.log("# your own commands (%s)" % ("dock" if connected else "undock"))
+            run_commands(cmds, log=self.log, env_extra=env)
+        return True
+
+    def apply_rule_now(self, rid, on):
+        """A rule switched while docked takes effect at once: on = do its docked
+        part, off = undo it. Rules that act at undock (lock, mute) wait for undock."""
+        st = (self.od_snap or {}).get("status") or {}
+        if not self.automation or not st.get("docked") or rid not in RULE_TOOLS:
+            return False
+        opt = ((self.od_desk() or {}).get("opt") or {})
+        desk = {"opt": {rid: opt.get(rid, "")}} if rid in ("proxy", "vpn") else {"opt": {}}
+        steps, _a, _s = desk_plan(desk, {"rules": {rid: 1}}, bool(on), self.iface)
+        if self.desk_applied:                       # so undock undoes what is in force now
+            seat = dict(self.desk_applied.get("seat") or {})
+            rules = dict(seat.get("rules") or {})
+            if on:
+                rules[rid] = 1
+            else:
+                rules.pop(rid, None)
+            seat["rules"] = rules
+            self.desk_applied["seat"] = seat
+            save_json(DESK_STATE_FILE, self.desk_applied)
+        if not steps:
+            return False
+        self.log("# rule %s %s — applied now" % (rid, "on" if on else "off"))
+        shell = []
+        for note, step in steps:
+            if isinstance(step, list):
+                self.do(step, note=note)
+            else:
+                self.log("# " + note)
+                shell.append(step)
+        if shell:
+            env = self.od_env()
+            env["DOCK_IFACE"] = self.iface or ""
+            run_commands(shell, log=self.log, env_extra=env)
+        return True
+
+    def restore_snapshot(self, text=None):
+        """Put the seat's saved configuration back."""
+        text = text if text is not None else ((self.od_seat() or {}).get("snap") or "")
+        steps = restore_plan(text)
+        if not steps:
+            self.log("# nothing to restore")
+            return 0
+        self.log("# configuration restored: %s" % snapshot_words(text))
+        for note, step in steps:
+            self.do(step, note=note)
+        return len(steps)
+
+    def save_snapshot_to_dock(self, done=None):
+        """Take a snapshot of this laptop and write it to the seat."""
+        text = take_snapshot()
+        self.od_desk_action("set_snap", text, done=done, note="configuration saved: " + snapshot_words(text))
+
+    def use_seat_phrase(self, phrase):
+        """Another laptop's words: this laptop becomes that seat at every dock."""
+        ph = seat_phrase_clean(phrase)
+        if not ph:
+            return False
+        if ph == self.seat_phrase:
             return True
-        return False
+        seat_save(ph)
+        self.seat_phrase, self.seat_id = ph, seat_id(ph)
+        if self.odlink is not None:
+            self.odlink.seat_id = self.seat_id
+            self.odlink.close()                   # reconnects within seconds, as the new seat
+        self.log("# seat key replaced; this laptop is now the same seat as the one that gave it")
+        return True
+
+    def od_report(self):
+        return dock_report(self.od_snap or {})
+
+    def od_usage(self, days=14):
+        snap = self.od_snap or {}
+        st = snap.get("status") or {}
+        entries = snap.get("log") or []
+        if self.odlink is not None and self.odlink.store:
+            entries = self.odlink.store.entries
+        return dock_usage(entries, days=days, docked_now=st.get("docked"), docked_s=st.get("docked_s", 0))
 
     # ---- running things -----------------------------------------------------------
     def do(self, args, note=None, after=None):
@@ -1425,8 +1989,11 @@ class Engine:
 
     def on_transition(self, connected):
         self.log("# dock %s" % ("connected" if connected else "disconnected"))
+        at_opendock = bool((self.od_snap or {}).get("connected"))
+        if self.automation and at_opendock and (self.rules["wifi"] or self.rules["audio"]):
+            self.log("# generic Wi-Fi/audio rules stand down — the OpenDock's rules decide here")
         if self.automation:
-            if self.rules["wifi"] and have("nmcli"):
+            if self.rules["wifi"] and have("nmcli") and not at_opendock:
                 self.do(["nmcli", "radio", "wifi", "off" if connected else "on"])
             if self.rules["mac"] and self.iface:
                 if connected:
@@ -1437,7 +2004,7 @@ class Engine:
                     self.mac_restore()
                 else:
                     self.log("# MAC restore skipped — interface no longer present")
-            if self.rules["audio"] and connected and have("pactl"):
+            if self.rules["audio"] and connected and have("pactl") and not at_opendock:
                 for s in list_sinks():
                     if "usb" in s.lower():
                         self.do(["pactl", "set-default-sink", s])
@@ -1797,7 +2364,7 @@ class Engine:
         if opendock is None or opendock.serial is None:
             return
         self.odlink = opendock.DockLink(
-            CONFIG_DIR,
+            CONFIG_DIR, seat_id=self.seat_id,
             on_connect=lambda l: self.marshal(self._od_connected),
             on_disconnect=lambda l: self.marshal(self._od_disconnected),
             on_event=lambda t: self.marshal(lambda: self._od_event(t)),
@@ -1818,14 +2385,18 @@ class Engine:
         ident, st = snap.get("identity") or {}, snap.get("status") or {}
         return {"DOCK_UID": ident.get("uid", ""), "DOCK_SERIAL": ident.get("serial", ""),
                 "DOCK_MODEL": ident.get("model", ""), "DOCK_FW": ident.get("fw", ""),
-                "DOCK_PORT": snap.get("port") or "", "DOCK_NAME": st.get("name", ""),
-                "DOCK_ASSETTAG": st.get("assettag", ""), "DOCK_SITE": st.get("site", "")}
+                "DOCK_PORT": snap.get("port") or "", "DOCK_NAME": st.get("name", ""), "DOCK_TAG": st.get("name", "")}
 
     def _od_connected(self):
         self.od_snap = self.odlink.snapshot()
         i = self.od_snap.get("identity") or {}
         self.log("# OpenDock %s (%s, fw %s) on %s" % (i.get("serial"), i.get("model"), i.get("fw"), self.od_snap.get("port")))
         if self.automation:
+            st = self.od_snap.get("status") or {}
+            if st.get("docked", True):               # a 0.5 dock that is not docked will say so with EVENT dock
+                self.apply_desk(True)
+                if ((self.od_seat() or {}).get("snap")):
+                    self.restore_snapshot()
             n = run_macros(self.macro_store, "opendock_connect", log=self.log, dock_model=i.get("model", ""), **self.od_env())
             if n:
                 self.log("# %d macro(s) fired" % n)
@@ -1836,11 +2407,18 @@ class Engine:
         self.od_snap = self.odlink.snapshot()
         self.log("# OpenDock gone (%s)" % (self.od_snap.get("error") or "unplugged"))
         if self.automation:
+            self.apply_desk(False)
             run_macros(self.macro_store, "opendock_disconnect", log=self.log, dock_model=env.get("DOCK_MODEL", ""), **env)
         self._emit("opendock", "disconnected")
 
     def _od_event(self, text):
         self.log("# OpenDock event: %s" % text)
+        if text in ("dock", "undock") and self.automation:
+            if text == "undock" and (self.od_seat() or {}).get("autosave"):
+                self.save_snapshot_to_dock()         # the laptop is still on the link for a moment
+            self.apply_desk(text == "dock")          # firmware 0.5 pushes these the moment VBUS changes
+            if text == "dock" and (self.od_seat() or {}).get("snap"):
+                self.restore_snapshot()
         self._emit("opendock", "event:" + text)
 
     def _od_new_log(self, entries):
@@ -1876,6 +2454,43 @@ class Engine:
             if done:
                 self.marshal(lambda: done(msg))
         threading.Thread(target=worker, daemon=True).start()
+
+    def od_desk_action(self, name, *args, done=None, note=None):
+        """One desk/seat write on the dock, on a worker. done(message) on the host thread."""
+        if not self.odlink or not self.odlink.connected:
+            if done:
+                done("no dock connected")
+            return
+        self.log("# OpenDock: %s" % (note or name.replace("_", " ")))
+
+        def worker():
+            try:
+                self.odlink.desk_action(name, *args)
+                msg = note or "saved"
+                if name == "set_rule" and len(args) == 2:
+                    self.marshal(lambda: self.apply_rule_now(args[0], args[1]))
+            except opendock.DockBusy as e:
+                msg = "not saved — dock busy: %s" % e
+            except opendock.DockError as e:
+                msg = "not saved: %s" % e
+            self.od_snap = self.odlink.snapshot()
+            self.log("# OpenDock " + msg)
+            if done:
+                self.marshal(lambda: done(msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def od_desk_export(self):
+        """The desk as a script file in the home folder. Returns the path."""
+        if not self.odlink or not self.odlink.connected or not self.odlink.dock.has_desk():
+            return None
+        lines = self.odlink.dock.export()
+        serial_no = self.od_serial() or "dock"
+        path = os.path.join(os.path.expanduser("~"), "opendock-desk-%s.txt" % serial_no)
+        with open(path, "w") as f:
+            f.write("# OpenDock desk %s — exported %s. Send back with: opendock import <file>\n" % (serial_no, time.strftime("%Y-%m-%d %H:%M")))
+            f.write("\n".join(lines) + "\n")
+        self.log("# OpenDock desk exported: %s" % path)
+        return path
 
     def od_clear(self, done=None):
         if not self.odlink or not self.odlink.connected:
@@ -1921,6 +2536,7 @@ class Engine:
                          "serial": ident.get("serial"), "model": ident.get("model"), "fw": ident.get("fw"),
                          "name": st.get("name"), "docked": st.get("docked"), "temp_c": st.get("temp_c"),
                          "vbus_v": st.get("vbus_v"), "log_entries": st.get("log_entries"),
+                         "tile": bool(((snap.get("seat") or {}).get("rules") or {}).get("tile")) and bool(st.get("docked")),
                          "error": snap.get("error")},
             "rules": dict(self.rules),
         }
@@ -1975,11 +2591,36 @@ class Service:
         notify("Dock connected" if connected else "Dock disconnected",
                "%s — wired link %s" % (ifc, "up" if connected else "down"), urgency="low")
 
+    def write_report(self, force=False):
+        """One JSON file per dock in the cache, rewritten only when something that
+        matters changed — never on a timer."""
+        e = self.engine
+        snap = e.od_snap or {}
+        if not snap.get("connected"):
+            return
+        rep = dock_report(snap)
+        key = report_key(rep)
+        if key == e.last_report_key and not force:
+            return
+        e.last_report_key = key
+        try:
+            os.makedirs(CACHE, exist_ok=True)
+            path = os.path.join(CACHE, "opendock-%s.json" % (rep.get("serial") or "unknown"))
+            tmp = path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(rep, f, indent=1)
+            os.replace(tmp, path)
+        except Exception:
+            pass
+
     def _on_opendock(self, what):
         snap = self.engine.od_snap
         i, st = snap.get("identity") or {}, snap.get("status") or {}
+        if what in ("connected", "log", "disconnected"):
+            self.write_report(force=(what == "connected"))
         if what == "connected":
-            notify("OpenDock %s" % i.get("serial", ""), "%s, firmware %s" % (st.get("name") or i.get("model", ""), i.get("fw", "")), urgency="low")
+            notify("OpenDock %s" % i.get("serial", ""),
+                   "%s, firmware %s" % (st.get("name") or i.get("model", ""), i.get("fw", "")), urgency="low")
         elif what == "disconnected":
             notify("OpenDock gone", snap.get("error") or "unplugged", urgency="low")
         elif what.startswith("event:temp"):
@@ -2038,6 +2679,42 @@ class Service:
         if cmd == "od_export":
             path = e.od_export()
             return {"ok": bool(path), "path": path}
+        if cmd == "report":
+            return {"ok": True, "report": e.od_report()}
+        if cmd == "usage":
+            return {"ok": True, "usage": e.od_usage(int(req.get("days", 14)))}
+        if cmd == "desk":
+            done = threading.Event()
+            box = {}
+
+            def fin(msg):
+                box["msg"] = msg
+                done.set()
+            args = req.get("args") or []
+            e.od_desk_action(str(req.get("action", "")), *args, done=fin)
+            done.wait(25)
+            return {"ok": True, "message": box.get("msg", "no reply"), "opendock": e.od_snap}
+        if cmd == "desk_export":
+            path = e.od_desk_export()
+            return {"ok": bool(path), "path": path}
+        if cmd == "save_setup":
+            done = threading.Event()
+            box = {}
+
+            def fin(msg):
+                box["msg"] = msg
+                done.set()
+            e.save_snapshot_to_dock(done=fin)
+            done.wait(25)
+            return {"ok": True, "message": box.get("msg", "no reply"), "opendock": e.od_snap}
+        if cmd == "restore_setup":
+            return {"ok": True, "steps": e.restore_snapshot()}
+        if cmd == "seat":
+            if req.get("phrase"):
+                return {"ok": e.use_seat_phrase(str(req.get("phrase")))}
+            return {"ok": True, "phrase": e.seat_phrase, "id": e.seat_id}
+        if cmd == "apply_desk":
+            return {"ok": e.apply_desk(bool(req.get("connected", True)))}
         if cmd == "reload":
             e.reload_rules_if_changed()
             return {"ok": True}
@@ -2130,6 +2807,37 @@ def ask(cmd, timeout=25.0, **kw):
         return None
 
 
+EXTENSION_UUID = "dockpilot@opendock.io"
+
+
+def ensure_extension_enabled():
+    """The top-bar indicator is a GNOME Shell extension the .deb installs. Enabling it from the
+    installer (root, outside the session) does not always take, so the service — which runs
+    inside the user's session — makes sure of it on every start. Returns True if it did something.
+    Harmless where there is no GNOME: nothing to enable, nothing to say."""
+    if not os.path.isdir("/usr/share/gnome-shell/extensions/" + EXTENSION_UUID):
+        return False
+    done = False
+    try:
+        import gi                                             # noqa: F401
+        from gi.repository import Gio
+        src = Gio.SettingsSchemaSource.get_default()
+        if src is not None and src.lookup("org.gnome.shell", True) is not None:
+            st = Gio.Settings.new("org.gnome.shell")
+            cur = list(st.get_strv("enabled-extensions"))
+            if EXTENSION_UUID not in cur:
+                st.set_strv("enabled-extensions", cur + [EXTENSION_UUID])
+                st.sync()
+                done = True
+    except Exception:
+        pass
+    try:                                                      # loads it into the running Shell, no re-login
+        subprocess.run(["gnome-extensions", "enable", EXTENSION_UUID], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+    except Exception:
+        pass
+    return done
+
+
 def service_main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--version"]:
@@ -2138,6 +2846,7 @@ def service_main(argv=None):
     if already_running():
         print("dockpilotd is already running (%s)" % SOCKET_PATH, file=sys.stderr)
         return 0
+    ensure_extension_enabled()
     Service().run()
     return 0
 
