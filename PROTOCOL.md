@@ -74,7 +74,7 @@ that has this says `"desk": {"opts": 9, "keys": 64, "seats": 8, "rules": 8}` in 
 
 | You send | The dock answers | What it means |
 |---|---|---|
-| `GET DESK` | one line of JSON | `tag`, every option (`""` = not set), how many `keys` and `seats`. Logged as `desk_read`, at most once a minute. |
+| `GET DESK` | one line of JSON | `tag`, every option (`""` = not set), how many `keys` and `seats`. Logged as `desk_read` once per visit: the first read after the dock starts, after a laptop docks or undocks, or after a program opens the serial port — not every time a client looks again, and at most once in ten minutes. |
 | `GET SCHEMA` | one JSON line per option, then `END` | The options this dock knows: `id`, `label`, `hint`, `type` (`int` or `str`), `min`, `max`. Show these; don't hard-code them. |
 | `SET TAG "<text>"` | `OK` | What people call this desk. (The same field as `SET NAME`.) |
 | `SET OPT <id> "<value>"` | `OK` | One desk option. Checked against the schema: `vlan` 1–4094, `mtu` 576–9000, the rest text up to 64 bytes. `""` clears it. |
@@ -83,7 +83,7 @@ that has this says `"desk": {"opts": 9, "keys": 64, "seats": 8, "rules": 8}` in 
 | `DEL KEY <name>` | `OK` | Remove one. |
 | `GET KEYS` | `KEY <name> "<value>"` lines, then `END` | All of them. |
 | `EXPORT` | `SET TAG …`, `SET OPT …`, `SET KEY …` lines, then `END` | The whole desk as a script you can send back. Save it to a file; that file *is* the desk. |
-| `IMPORT` … `IMPORT END` | `OK` | Between the two, `SET TAG/OPT/KEY` and `DEL KEY` are staged in RAM and nothing is written. `IMPORT END` writes once (one unit of the write budget). The import defines the whole desk: options and keys not in it are gone. `IMPORT ABORT` drops the staging; so does disconnecting. |
+| `IMPORT` … `IMPORT END` | `OK` | Between the two, `SET TAG/OPT/KEY` and `DEL KEY` are staged in RAM and nothing is written. `IMPORT END` writes once (one unit of the write budget). The import defines the whole desk: options and keys not in it are gone. `IMPORT ABORT` drops the staging; so does disconnecting. Over HTTP a session lasts one request, so send `IMPORT`, the lines and `IMPORT END` in one `POST` (ending with `IMPORT ABORT` instead rehearses the file: the replies show what the dock would refuse, and nothing is written). |
 
 **The seat** (one per laptop that keeps anything here): a laptop sends `SEAT <id>` once per connection,
 where `<id>` is 16 hex characters it derives from its own secret key (DockPilot hashes the key).
@@ -124,6 +124,15 @@ Every `POST` must carry the header `X-OpenDock: 1` (any value), or the answer is
 `curl -H 'X-OpenDock: 1' --data-binary 'GET DESK' http://opendock.local/api`. The header is what
 keeps other web pages out: a browser only sends a custom header to another site after asking it
 (a CORS preflight), and the dock never answers that question. There are no CORS headers at all.
+
+Every request must also be addressed to the dock itself: its `Host` line must name
+`opendock.local` or `169.254.77.1` (any port), or the answer is `403` with
+`ERR forbidden this dock answers only by its own name or address`. That keeps out a web page that
+points a name of its own at the dock's address. A request with no `Host` line at all is answered.
+
+A request may be up to 16 KB, headers and body — a whole desk fits in one — and a reply up to
+24 KB. A larger request is answered `413` with `ERR toolong request over 16 KB`. The firmware
+upload is not bound by this.
 
 **Keys as URLs.** Every key is also a web address, so a script on any device that can reach the
 cable reads or writes it with nothing but HTTP — no protocol, no quoting, no app:
@@ -187,7 +196,7 @@ and sometimes `v` (a detail).
 | `log_cleared` | `CLEAR LOG` was used | |
 | `fault` | the firmware hit a problem and carried on | |
 | `desk_change` | the desk was written (firmware 0.6) | 2 option · 3 key · 4 import · 5 seat · 6 seat forgotten (1 is unused: the tag logs as `config_change` 1) |
-| `desk_read` | the desk was handed to a laptop (`GET DESK`), at most once a minute | |
+| `desk_read` | the desk was handed to a laptop (`GET DESK`), once per visit | |
 | `fw_update` | a firmware update (firmware 1.0, C line) | 1 new firmware written, restarting into it · 2 new firmware running (it confirmed itself) |
 
 The dock keeps the newest 2048 entries. To collect the log without fetching anything twice,
@@ -203,7 +212,7 @@ remember the last `i` you saw and ask `GET LOG <that+1>`. `STATUS` tells you the
 | `badcmd` | the dock doesn't know that command | don't send it again |
 | `badarg` | a missing or malformed argument | fix the command |
 | `range` | a value is out of range (e.g. a name over 64 bytes) | shorten it |
-| `toolong` | the line was over 512 bytes | send shorter lines |
+| `toolong` | the line was over 512 bytes (over HTTP also: the request was over 16 KB) | send shorter lines |
 | `busy` | not right now — the message says why, and how long to wait if waiting helps | wait that long, try once more |
 
 ## If you are building a dock
