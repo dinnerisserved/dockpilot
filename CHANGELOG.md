@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.3 — 17 November 2026
+
+For the OpenDock firmware build of 17 November 2026 (still firmware 1.0.0). With older firmware 1.3 behaves
+like 1.2. Nothing changes for docks without an OpenDock board.
+
+- **VPN, chosen on the dock's page.** DockPilot tells the dock which VPNs this laptop has (names only,
+  kept in the dock's RAM) and which one is up; the dock's page lists them and stores the seat's choice;
+  select one and press Connect, and DockPilot brings it up now and every time you dock; Disconnect takes it down.
+  WireGuard first; any VPN NetworkManager already has is listed too. The keys never leave the laptop.
+- **Add servers** from the page: the page opens `opendock://vpn-import`, DockPilot (registered for the
+  scheme) opens its own file window, and the chosen `.conf` files or provider `.zip` go into
+  NetworkManager — named after the file, grouped by provider, never connecting by themselves.
+  Only the action's name is read from an `opendock://` link; nothing else in it is used.
+- **Changes made in the dock are acted on at once.** The dock counts its stored changes (`STATUS` `rev`);
+  DockPilot polls once a second and, when it moves, reads the desk and its seat again and does what
+  differs: a rule switched, an option set or switched off, the VPN choice. No waiting for the next dock.
+- New rule from the dock: **Drop the VPN when I undock** (off = the VPN stays with you).
+- The saved configuration no longer holds or restores VPNs (the choice above decides).
+- Window: "At this desk" is gone, Dock Name, Activity, a switch on every desk option, a VPN row that
+  opens the dock's page. The log no longer shows "desk handed to a laptop".
+- `OPENDOCK_PORTS=/dev/ttyX[,…]` makes DockPilot ask exactly those serial ports (tests, odd set-ups).
+- A dock with the 17 Nov firmware carries its own copy of DockPilot (`http://opendock.local/dockpilot.deb`).
+  That copy is labelled 1.2 and has the same program code as 1.3.
+
 ## 1.2 — November 2026
 
 ### OpenDock (firmware 0.6 → 1.0)

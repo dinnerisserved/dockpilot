@@ -972,28 +972,27 @@ class Window(Adw.ApplicationWindow):
         sw.add_css_class("card")
         return tv, sw
 
-    # -- Dock: this dock, right now, at this desk
+    # -- Dock: this dock, and what it has been doing
     def _tab_dock(self, page, snap):
         g = group("This dock")
         self.widgets["od_rows"] = {}
-        rows_spec = [("serial", "Serial"), ("model", "Model")]
+        rows_spec = [("model", "Model")]
         if snap.get("health") is not None:
             rows_spec.append(("health", "Health"))
-        rows_spec.append(("tag", "Desk"))
+        rows_spec.append(("tag", "Dock Name"))
         if (snap.get("caps") or {}).get("web"):
-            rows_spec.append(("web", "Panel"))
-        rows_spec.append(("site", "Website"))
+            rows_spec.append(("web", "URL"))
         for k, t in rows_spec:
             r = row(t, "—")
             self.widgets["od_rows"][k] = r
             g.add(r)
         if (snap.get("caps") or {}).get("web"):
             r = row("Firmware", "—")
-            r.add_suffix(button("Update…", self._firmware_update))
+            r.add_suffix(button("Select new firmware file to update", self._firmware_update))
             self.widgets["od_rows"]["fw"] = r
             g.add(r)
         page.add(g)
-        g2 = group("Right now")
+        g2 = group("Activity")
         rows2 = []
         if (snap.get("status") or {}).get("vbus_v") is not None:
             rows2.append(("power", "Power"))
@@ -1005,25 +1004,21 @@ class Window(Adw.ApplicationWindow):
             self.widgets["od_rows"][k] = r
             g2.add(r)
         page.add(g2)
-        if snap.get("desk") is not None:
-            g3 = group("At this desk", "What the dock handed to this laptop when it docked. Applied while docked.")
-            for k, t in (("net", "Network"), ("dns", "DNS"), ("time", "Time"), ("proxy", "Proxy"), ("vpn", "VPN"), ("keys", "Keys stored")):
-                r = row(t, "—")
-                self.widgets["od_rows"][k] = r
-                g3.add(r)
-            page.add(g3)
-        else:
-            g3 = group("At this desk")
-            g3.add(row("Nothing handed out", self._no_desk(snap), prop=False))
+        if ((snap.get("caps") or {}).get("desk") or {}).get("vpn"):
+            g3 = group("VPN", "Chosen on the dock’s own page; connected by this laptop when you dock. Your VPN keys stay on this laptop.")
+            r = row("At this desk", "—")
+            r.add_suffix(button("Open the VPN page", self._open_vpn_page, tooltip="The dock’s page, in your browser"))
+            self.widgets["od_rows"]["vpn"] = r
+            g3.add(r)
             page.add(g3)
         self._opendock_tick()
 
     # -- Setup: what is kept in the dock
     def _tab_setup(self, page, snap):
         st = snap.get("status") or {}
-        g = group("Kept in the dock")
+        g = group("Dock name")
         er = Adw.EntryRow()
-        er.set_title("Desk Tag")
+        er.set_title("Dock Name")
         er.set_text(str(st.get("name", "") or ""))
         er.set_show_apply_button(True)
         er.connect("apply", lambda w: self._od_set("name", w.get_text()))
@@ -1037,13 +1032,24 @@ class Window(Adw.ApplicationWindow):
             return
         desk = snap.get("desk") or {}
         opt = desk.get("opt") or {}
-        g2 = group("Desk options", "Apply the DHCP options shown or leave blank. Will be automatically appended every time you connect to this dock from this computer.")
+        held, off = desk.get("held") or {}, desk.get("off")
+        g2 = group("Desk options", "Add a setting, then switch it on to inject it into your laptop at every dock. Off keeps the value but stops injecting it; "
+                   "blank means the dock ignores it. VLAN, IP address and DNS are applied to the dock’s wired network connection while you are docked, "
+                   "and undone when you leave; Wi-Fi is never changed. The proxy is the laptop’s system proxy.")
         for o in snap.get("schema") or []:
             er = Adw.EntryRow()
             er.set_title(o["label"] + (" — " + o["hint"] if o.get("hint") else ""))
-            er.set_text(str(opt.get(o["id"], "") or ""))
+            er.set_text(str(opt.get(o["id"]) or held.get(o["id"]) or ""))
             er.set_show_apply_button(True)
-            er.connect("apply", lambda w, oid=o["id"]: self._desk("set_opt", oid, w.get_text().strip(), note="%s saved" % oid))
+            er.connect("apply", lambda w, oid=o["id"], lab=o["label"]: self._desk("set_opt", oid, w.get_text().strip(), note="%s saved" % lab))
+            if off is not None:                       # a dock with switches (firmware build of 16 Nov 2026 or later)
+                sw = Gtk.Switch()
+                sw.set_valign(Gtk.Align.CENTER)
+                sw.set_tooltip_text("Inject at every dock")
+                sw.set_active(o["id"] not in off)
+                sw.connect("notify::active", lambda w, _p, oid=o["id"], lab=o["label"]: self._desk(
+                    "set_use", oid, w.get_active(), note="%s — %s" % (lab, "on: injected at every dock" if w.get_active() else "off: kept, not injected")))
+                er.add_suffix(sw)
             g2.add(er)
         page.add(g2)
         self._below(page, button("Apply from file", self._desk_import, tooltip="A file made by Export, or written by hand"),
@@ -1072,7 +1078,7 @@ class Window(Adw.ApplicationWindow):
             return
         seat = snap.get("seat") or {}
         rules_on = seat.get("rules") or {}
-        g = group("Rules", "What the laptop does when it docks here. Stored in the dock, so they follow the desk, not the laptop.")
+        g = group("Rules", "What the laptop does when it docks here. Changes made here take effect straight away.")
         for r in snap.get("rules") or []:
             tool = core.RULE_TOOLS.get(r["id"], None)
             known = r["id"] in core.RULE_TOOLS
@@ -1091,7 +1097,7 @@ class Window(Adw.ApplicationWindow):
         page.add(g)
 
         cmd = seat.get("cmd") or {}
-        g2 = group("Your own commands", "Run something of your own when you dock or undock — mount a drive, start a backup, open the apps you use at this desk. "
+        g2 = group("Your own commands", "Run something of your own when you dock or undock — mount a drive, start a backup or open/close apps. "
                    "One command per line, as you would type it in a terminal. Kept in the dock, run by this laptop as you, from your home folder, "
                    "in the background: there is no terminal, so anything a command prints goes to the Logs page. $DOCK_TAG and $DOCK_SERIAL are set.")
         for when, title in (("dock", "When I dock"), ("undock", "When I undock")):
@@ -1148,7 +1154,7 @@ class Window(Adw.ApplicationWindow):
 
         g = group("Log file")
         entries = snap.get("log") or []
-        tv, sw = self._textbox("\n".join(core.opendock.describe(x) for x in entries[-300:]) or "(nothing yet)")
+        tv, sw = self._textbox("\n".join(core.opendock.describe(x) for x in [e for e in entries if e.get("ev") != "desk_read" and not (e.get("ev") == "desk_change" and e.get("v") == 5)][-300:]) or "(nothing yet)")
         g.add(sw)
         page.add(g)
         self._below(page, button("Export", self._od_export, tooltip="A JSON file in your home folder"),
@@ -1158,7 +1164,7 @@ class Window(Adw.ApplicationWindow):
         r = core.ask("report") if self.use_service else None
         rep = r.get("report") if r and r.get("ok") else self.engine.od_report()
         text = json.dumps(rep, indent=1)
-        g2 = group("Configuration", "What an inventory or network system receives — fixed field names, nothing personal. Also kept as a file in ~/.cache/dockpilot/.")
+        g2 = group("Configuration", "This dock’s details in one block: model, serial, firmware, name, settings and hours used. Copy it into an asset list or a support request. Also kept as a file in ~/.cache/dockpilot/.")
         _tv, sw2 = self._textbox(text)
         g2.add(sw2)
         page.add(g2)
@@ -1390,15 +1396,13 @@ class Window(Adw.ApplicationWindow):
             self.show("OpenDock")
             return
         i, s = snap.get("identity") or {}, snap.get("status") or {}
-        rows["serial"].set_subtitle("%s · chip id %s · on %s" % (i.get("serial"), i.get("uid"), snap.get("port")))
-        rows["model"].set_subtitle("%s · firmware %s · protocol v%s" % (i.get("model"), i.get("fw"), i.get("proto")))
+        rows["model"].set_subtitle("%s · serial %s" % (i.get("model"), i.get("serial")))
         rows["tag"].set_subtitle((s.get("name") or "—") + "   (edit under Setup)")
         web = (snap.get("caps") or {}).get("web")
         if web and "web" in rows:
-            rows["web"].set_subtitle("http://%s · http://%s — the dock’s own page, any browser, any computer" % (web.get("host"), web.get("ip")))
-        rows["site"].set_subtitle(core.WEBSITE)
+            rows["web"].set_subtitle("http://%s or http://%s" % (web.get("host"), web.get("ip")))
         if "fw" in rows:
-            rows["fw"].set_subtitle("%s — a new one from %s goes in here; the current one stays as the fallback." % (i.get("fw"), core.WEBSITE))
+            rows["fw"].set_subtitle("Version %s" % i.get("fw"))
         if "power" in rows and s.get("vbus_v") is not None:
             v = s["vbus_v"] * (470 + 47) / 47          # the pin sees VBUS through 470k:47k
             rows["power"].set_subtitle("%.0f V on the host port" % v if v > 1 else "nothing on the host port")
@@ -1417,25 +1421,18 @@ class Window(Adw.ApplicationWindow):
                 core._hms_short(sx.get("docked_s", 0)), sx.get("docks", 0), sx.get("boots", 0),
                 sx.get("temp_max") if sx.get("temp_max") is not None else "—",
                 " · counters in RAM only (dev jumper)" if sx.get("volatile") else ""))
-        desk = snap.get("desk")
-        if desk is not None and "net" in rows:
-            opt = desk.get("opt") or {}
-            rules = (snap.get("seat") or {}).get("rules") or {}
-            net = []
-            if opt.get("vlan"):
-                net.append("VLAN " + opt["vlan"])
-            if opt.get("mtu"):
-                net.append("MTU " + opt["mtu"])
-            net.append(("address " + opt["addr"]) if opt.get("addr") else "address from the network")
-            rows["net"].set_subtitle(" · ".join(net))
-            dns = opt.get("dns") or "from the network"
-            if opt.get("domain"):
-                dns += " · search " + opt["domain"]
-            rows["dns"].set_subtitle(dns)
-            rows["time"].set_subtitle(" · ".join(x for x in (opt.get("ntp"), opt.get("tz")) if x) or "from the network")
-            rows["proxy"].set_subtitle((opt["proxy"] + (" — in use (your rule)" if rules.get("proxy") else " — not used by this laptop")) if opt.get("proxy") else "none")
-            rows["vpn"].set_subtitle((opt["vpn"] + (" — connected when you dock (your rule)" if rules.get("vpn") else " — not used by this laptop")) if opt.get("vpn") else "none")
-            rows["keys"].set_subtitle("%s" % desk.get("keys", 0))
+        if "vpn" in rows:
+            seat = snap.get("seat") or {}
+            pick = seat.get("vpn") or ""
+            rows["vpn"].set_subtitle(("%s — connected when you dock" % pick) if pick and seat.get("vpn_on")
+                                     else ("%s — chosen, switched off" % pick) if pick else "No VPN chosen for this desk")
+
+    def _open_vpn_page(self):
+        web = ((self.engine.od_snap or {}).get("caps") or {}).get("web") or {}
+        try:
+            Gio.AppInfo.launch_default_for_uri("http://%s/#vpn" % (web.get("host") or "opendock.local"), None)
+        except Exception as ex:
+            self.toast("Couldn't open the browser: %s" % ex, 5)
 
     def _od_set(self, key, value):
         if self.use_service:
@@ -1496,14 +1493,101 @@ def service_available():
     return False
 
 
+# --------------------------------------------------------------------------- opendock:// links
+# The dock's own page cannot touch this laptop; for the few things that must happen here it opens
+# a link: opendock://<action>. DockPilot is registered for that scheme (dockpilot.desktop).
+# Only the action's name is read, against the fixed list below. Nothing else in the link — no
+# path, no command, no file name — is ever used: what is done is decided here, by the person,
+# in a window of this laptop.
+def url_main(url):
+    action = core.url_action(url)
+    if action is None:
+        print("DockPilot: not a link it knows: %s" % str(url)[:80], file=sys.stderr)
+        return 2
+    if action == "open":
+        return App().run([sys.argv[0]])
+    app = Adw.Application(application_id=APP_ID + ".Link", flags=Gio.ApplicationFlags.NON_UNIQUE)
+
+    def activate(a):
+        win = Adw.ApplicationWindow(application=a)
+        win.set_title("DockPilot — add VPN servers")
+        win.set_default_size(520, 260)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.append(Adw.HeaderBar())
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        for m in ("top", "bottom", "start", "end"):
+            getattr(body, "set_margin_" + m)(18)
+        label = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        label.set_text("Choose WireGuard files: single .conf files, or the .zip your VPN provider gives you.\n"
+                       "They go into this laptop’s network settings. The dock is told their names, never their keys.")
+        spinner = Gtk.Spinner()
+        close = button("Close", lambda: a.quit())
+        close.set_halign(Gtk.Align.END)
+        close.set_visible(False)
+        body.append(label)
+        body.append(spinner)
+        body.append(close)
+        box.append(body)
+        win.set_content(box)
+        win.present()
+
+        def finish(text):
+            spinner.stop()
+            spinner.set_visible(False)
+            label.set_text(text)
+            close.set_visible(True)
+            return False
+
+        def chosen(d, res):
+            try:
+                files = d.open_multiple_finish(res)
+                paths = [files.get_item(i).get_path() for i in range(files.get_n_items())]
+                paths = [p for p in paths if p]
+            except Exception:
+                paths = []
+            if not paths:                                  # cancelled
+                a.quit()
+                return
+            label.set_text("Adding %d file%s…" % (len(paths), "" if len(paths) == 1 else "s"))
+            spinner.start()
+
+            def work():
+                if not service_available():
+                    GLib.idle_add(finish, "DockPilot’s background service is not running, so nothing was added.\n"
+                                          "Start it with:  systemctl --user start dockpilot.service")
+                    return
+                res2 = core.ask("vpn_import", timeout=1800.0, paths=paths)
+                GLib.idle_add(finish, core.vpn_import_words(res2))
+            threading.Thread(target=work, daemon=True).start()
+
+        dlg = Gtk.FileDialog()
+        dlg.set_title("Add VPN servers")
+        flt = Gtk.FileFilter()
+        flt.set_name("WireGuard files (.conf, .zip)")
+        flt.add_pattern("*.conf")
+        flt.add_pattern("*.zip")
+        flt.add_pattern("*.CONF")
+        flt.add_pattern("*.ZIP")
+        store = Gio.ListStore.new(Gtk.FileFilter)
+        store.append(flt)
+        dlg.set_filters(store)
+        dlg.set_default_filter(flt)
+        dlg.open_multiple(win, None, chosen)
+
+    app.connect("activate", activate)
+    return app.run([sys.argv[0]])
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--version"]:
-        print("DockPilot " + core.APP_VERSION)
+        print("DockPilot %s (build of %s)" % (core.APP_VERSION, core.APP_BUILD))
         return 0
     if argv[:1] == ["--helper-check"]:        # used by the installer's tests: is the helper where we expect?
         print(core.HELPER if os.path.exists(core.HELPER) else "missing: " + core.HELPER)
         return 0 if os.path.exists(core.HELPER) else 1
+    if argv[:1] and argv[0].lower().startswith("opendock:"):
+        return url_main(argv[0])
     app = App()
     return app.run([sys.argv[0]])
 

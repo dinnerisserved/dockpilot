@@ -76,34 +76,45 @@ Every device below was tested on a real machine.
 ## OpenDock
 
 Most docks are anonymous boxes. A dock built with the OpenDock board from
-[opendocktech.com](https://opendocktech.com) answers questions over a USB serial port, and from
-firmware 0.6 it stores the settings of the desk it sits on. Plug a laptop in and DockPilot reads
-those settings and applies them; unplug it and they are removed again. The dock stores; DockPilot
-does the work on the laptop.
+[opendocktech.com](https://opendocktech.com) stores the settings of the desk it sits on. Plug a
+laptop in and DockPilot reads those settings and applies them; unplug it and they are removed
+again. The dock stores; DockPilot does the work on the laptop. The dock is never in the path of
+your network traffic.
 
-The **OpenDock** page has four tabs:
+**The dock has its own page.** From firmware 1.0 the dock is a tiny web server on the USB cable:
+`http://opendock.local` (or `http://169.254.77.1`) in any browser, no app needed to look. With
+DockPilot running, the same page also *changes* things: switch a rule, set an option, choose a
+VPN — DockPilot notices within a second and does it on the laptop. The page has five tabs (Dock,
+Setup, Rules, VPN, Records); DockPilot's own **OpenDock** page shows the same four without VPN:
 
-- **Dock.** What it is, how it's doing (health, temperature, power on the host port, lifetime
-  counters), where its own page is (from firmware 1.0 the dock is also a tiny web server on the
-  cable: `http://opendock.local`, any browser, any computer, no app), a *Firmware → Update…*
-  button that sends a new firmware file to the dock, and *At this desk*: what the dock handed to
-  this laptop — VLAN, MTU, address, DNS, time, proxy, VPN — applied while docked.
-- **Setup.** What is kept in the dock: the desk tag, the nine desk options (validated by the dock
-  itself), and key storage — up to 64 named values for anything else, read and written by
-  scripts with `opendock get|set|del <name>` and `opendock keys`, or by anything that can fetch a
-  URL: `http://opendock.local/key/<name>`. *Export* writes the whole desk as a text file; *Apply from file* sends one
-  back in a single write, so fifty docks are provisioned from one file.
-- **Rules.** This laptop at this desk: Wi-Fi off while docked, sound through the dock, lock or
-  mute on undock, touchpad off, use the desk's VPN or proxy, show the icon in the top bar; your own
-  commands on dock and undock; a saved configuration (screens, sound, keyboard, VPN) restored every
-  time you dock, saved again on undock if you like. All of it is stored in the dock under a seat
-  key only your laptops know — the dock never learns who you are. *Show my key* gives six words to
-  type into DockPilot on your other laptop, which then is the same seat at every dock.
+- **Dock.** What it is and how it's doing: name, model and serial, health, temperature, power on
+  the host port, lifetime counters, where its page is, and *Firmware → Update…*, which sends a new
+  firmware file to the dock.
+- **Setup.** What is kept in the dock: the dock name; four desk options, each with its own switch
+  — VLAN, IP address, DNS servers, proxy — applied to the dock's wired connection while docked
+  (never to Wi-Fi) and undone when you unplug; and key storage — up to 64 named values for
+  anything else, read and written by scripts with `opendock get|set|del <name>` and
+  `opendock keys`, or by anything that can fetch a URL: `http://opendock.local/key/<name>`.
+  *Export* writes the whole desk as a text file; *Apply from file* sends one back in a single
+  write, so fifty docks are provisioned from one file.
+- **Rules.** What the laptop does when it docks here: Wi-Fi off while docked, sound through the
+  dock, lock or mute on undock, touchpad off, drop the VPN on undock, show the icon in the top
+  bar; your own commands on dock and undock; a saved configuration (screens, sound, keyboard)
+  restored every time you dock. A change takes effect straight away. All of it is stored in the
+  dock under a seat key only your laptops know. *Show my key* gives six words to type into
+  DockPilot on your other laptop, which then is the same seat at every dock.
+- **VPN** (on the dock's page). DockPilot tells the dock the names of the VPNs this laptop has;
+  the page lists them, grouped by provider. Pick one and press *Connect*: DockPilot brings it up
+  through NetworkManager, and brings it up again every time you dock at this desk. *Add servers*
+  takes WireGuard `.conf` files or a provider's `.zip`. The dock keeps only the name of your
+  choice; keys stay in the laptop's NetworkManager.
 - **Records.** Hours docked per day from the dock's own log, the log file (export, clear), and the
   configuration record an inventory system receives (`opendock-report/2`, also kept up to date in
   `~/.cache/dockpilot/opendock-<serial>.json`).
 
-A dock with older firmware still shows Dock and Records; Setup and Rules say what is missing.
+A dock with older firmware still shows Dock and Records; Setup and Rules say what is missing. The
+VPN tab and changes from the page need DockPilot 1.3 and the firmware build of 17 November 2026
+or later.
 
 **Firmware updates** (firmware 1.0 and later): the dock keeps two copies of its firmware. An
 update goes into the copy that is not running, the dock restarts with it, and if the new firmware
@@ -123,12 +134,12 @@ Want to build a dock that speaks it, or script one yourself? The protocol fits o
 
 ## Install & run
 
-**Ubuntu (recommended) — the .deb.** Download `dockpilot_1.2-1_all.deb` from the
+**Ubuntu (recommended) — the .deb.** Download `dockpilot_1.3-1_all.deb` from the
 [latest release](https://github.com/dinnerisserved/dockpilot/releases), double-click it (App
 Center → **Install**) or:
 
 ```bash
-sudo apt install ./dockpilot_1.2-1_all.deb
+sudo apt install ./dockpilot_1.3-1_all.deb
 ```
 
 Log out and in once. You get DockPilot in the app menu, a background service that runs your

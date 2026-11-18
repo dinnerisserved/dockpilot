@@ -59,7 +59,7 @@ EVENT_NAMES = {
     "temp_high": "temperature high", "temp_ok": "temperature back to normal",
     "config_change": "setting changed", "time_sync": "clock set", "log_cleared": "log cleared",
     "fault": "firmware fault (carried on)",
-    "desk_change": "desk written", "desk_read": "desk handed to a laptop",
+    "desk_change": "desk written", "desk_read": "desk read",
     "fw_update": "firmware update",
 }
 DESK_CHANGE = {1: "tag", 2: "option", 3: "key", 4: "import", 5: "seat", 6: "seat forgotten"}
@@ -152,6 +152,9 @@ def _busy_wait(message):
 
 def candidate_ports():
     """Serial ports worth asking. Ports whose USB strings say OpenDock come first."""
+    forced = os.environ.get("OPENDOCK_PORTS")        # for tests and odd set-ups: exactly these ports, comma-separated
+    if forced:
+        return [p for p in forced.split(",") if p]
     ports = sorted(set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*") + glob.glob("/dev/tty.usbmodem*")))
     if serial is None:
         return ports
@@ -476,6 +479,10 @@ class Dock:
             raise DockRefused("range", why)
         return self.command("SET OPT %s %s" % (oid, quote(value))) == "OK"
 
+    def set_use(self, oid, on):
+        """An option's switch: off keeps the value in the dock and hands it to no laptop."""
+        return self.command("SET USE %s %d" % (oid, 1 if on else 0)) == "OK"
+
     def set_key(self, name, value):
         why = validate_text(value, KEY_LIMIT)
         if why:
@@ -535,6 +542,57 @@ class Dock:
 
     def forget_seat(self):
         return self.command("FORGET SEAT") == "OK"
+
+    # ---- the VPN: chosen on the dock's page, made by this laptop (firmware build of 17 Nov 2026)
+    def has_vpn(self):
+        return bool(self.has_desk() and self.caps["desk"].get("vpn"))
+
+    def set_vpn(self, name):
+        """This seat's choice. Choosing switches it on; "" forgets it."""
+        why = validate_text(name, OPT_LIMIT)
+        if why:
+            raise DockRefused("range", why)
+        return self.command("SET VPN %s" % quote(name)) == "OK"
+
+    def set_vpn_on(self, on):
+        return self.command("SET VPNON %d" % (1 if on else 0)) == "OK"
+
+    def vpn_publish(self, entries):
+        """Tell the dock which VPNs this laptop has: [(group, name), ...]. Kept in the dock's RAM for
+        its page; costs no flash. Names only — keys stay here. Returns how many the dock took."""
+        self.command("VPN BEGIN")
+        n = 0
+        try:
+            for group, name in entries:
+                try:
+                    self.command("VPN ADD %s" % quote("%s\n%s" % (group, name)))
+                    n += 1
+                except DockRefused as e:
+                    if e.code == "full":
+                        break
+                    continue                      # a name the dock cannot show is left out, the rest goes on
+        finally:
+            self.command("VPN END")
+        return n
+
+    def vpn_state(self, state, name="", message=""):
+        """up | down | connecting | failed, the VPN it is about, and a sentence if it failed."""
+        return self.command("VPN STATE %s %s" % (state, quote("%s\n%s" % (name, message[:90])))) == "OK"
+
+    def get_vpn(self):
+        """What the dock holds of the above: (head, [{"n": name, "g": group}, ...])."""
+        head, rows, frm = {}, [], 0
+        while True:
+            lines = self._lines("GET VPN %d" % frm)
+            if not lines:
+                break
+            head = json.loads(lines[0])
+            page = [json.loads(l) for l in lines[1:]]
+            rows.extend(page)
+            frm += len(page)
+            if not page or frm >= head.get("n", 0):
+                break
+        return head, rows
 
     def get_log(self, frm=1, mx=None):
         """GET LOG: a list of entry dicts. An abandoned transfer (no END) raises DockGone."""
@@ -721,10 +779,12 @@ class DockLink:
 
     RESCAN_S = 5.0
 
-    def __init__(self, config_dir, on_connect=None, on_disconnect=None, on_event=None, on_log=None, seat_id=None):
+    def __init__(self, config_dir, on_connect=None, on_disconnect=None, on_event=None, on_log=None, seat_id=None, on_change=None):
         self.config_dir = config_dir
         self.on_connect, self.on_disconnect = on_connect, on_disconnect
         self.on_event, self.on_log = on_event, on_log
+        self.on_change = on_change       # the desk or this seat was changed in the dock (by the dock's page, by another program)
+        self._rev = None                 # STATUS "rev" when the desk was last read
         self.seat_id = seat_id           # 16 hex chars this laptop derives from its key, or None
         self.dock = None
         self.store = None
@@ -812,6 +872,7 @@ class DockLink:
             self.dock, self.port, self.store, self.error = d, port, store, ""
             self.health, self.stats, self.notes, self._polls = h, sx, notes or {}, 0
             self.desk, self.schema, self.rules, self.keys, self.seat = None, [], [], {}, None
+            self._rev = None
         self._load_desk(full=True)
         if self.on_connect:
             self.on_connect(self)
@@ -843,7 +904,15 @@ class DockLink:
             h = sx = None
             if self._polls % 5 == 1:                      # every ~10 s: cheap, and nothing to write
                 h, sx = self.dock.health(), self.dock.stats()
-            if self._polls % 15 == 2:                     # every ~30 s: another laptop may have written
+            changed = False
+            if "rev" in st:                               # the dock counts its stored changes: read again the moment it moves
+                if self._rev is None:
+                    self._rev = st["rev"]
+                elif st["rev"] != self._rev:
+                    self._rev = st["rev"]
+                    self._load_desk()
+                    changed = True
+            elif self._polls % 15 == 2:                   # an older dock: every ~30 s, another laptop may have written
                 self._load_desk()
             with self._lock:
                 self.status = st
@@ -854,6 +923,8 @@ class DockLink:
             new = self.store.collect(self.dock, st)
             if new and self.on_log:
                 self.on_log(new)
+            if changed and self.on_change:
+                self.on_change(self)
         except DockError as e:
             self._lost(str(e))
 

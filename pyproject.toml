@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dockpilot"
-version = "1.2"
+version = "1.3"
 description = "See and manage your laptop docking station — Ubuntu-native (GTK 4 / libadwaita)"
 readme = "README.md"
 requires-python = ">=3.10"

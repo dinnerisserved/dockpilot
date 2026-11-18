@@ -13,8 +13,11 @@ top-bar tile, and answers the window on a Unix socket, one JSON object per line.
 """
 
 import glob
+import hashlib
 import os
 import re
+import tempfile
+import zipfile
 import sys
 import json
 import platform
@@ -38,7 +41,8 @@ except ImportError:
 # --------------------------------------------------------------------------- #
 #  config — beside the script only
 # --------------------------------------------------------------------------- #
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
+APP_BUILD = "17 Nov 2026"                         # which build of this version it is
 WEBSITE = "opendocktech.com"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +75,7 @@ AUTOMATION_FILE = os.path.join(CONFIG_DIR, "automation.json")
 DOCKMEM_FILE = os.path.join(CONFIG_DIR, "dock_memory.json")
 SEAT_FILE = os.path.join(CONFIG_DIR, "seat_key")          # this laptop's seat key: six words
 DESK_STATE_FILE = os.path.join(CONFIG_DIR, "desk_applied.json")   # what was applied, to undo at undock
+VPN_FILE = os.path.join(CONFIG_DIR, "vpn.json")                   # which group each imported VPN belongs to, and the one DockPilot brought up
 
 def load_json(path, default):
     try:
@@ -1051,10 +1056,10 @@ def seat_save(phrase, path=None):
 # What the laptop does with each rule the dock knows. Unknown rule ids (a newer dock)
 # are shown by the app and ignored here. (tool needed, or None)
 RULE_TOOLS = {"wifi_off": "nmcli", "audio_dock": "pactl", "lock_undock": "loginctl", "mute_undock": "pactl",
-              "touchpad_off": "gsettings", "vpn": "nmcli", "proxy": "gsettings", "tile": None}
+              "touchpad_off": "gsettings", "vpn_drop": "nmcli", "proxy": "gsettings", "tile": None}
 # Desk options this laptop can apply, and what it needs. The rest (ntp) is kept by the dock and shown.
 OPT_TOOLS = {"vlan": "nmcli", "mtu": "nmcli", "addr": "nmcli", "dns": "nmcli", "domain": "nmcli",
-             "tz": "timedatectl", "proxy": "gsettings", "vpn": "nmcli"}
+             "tz": "timedatectl", "proxy": "gsettings"}
 
 
 def desk_plan(desk, seat, connected, iface, have_fn=None):
@@ -1144,17 +1149,7 @@ def desk_plan(desk, seat, connected, iface, have_fn=None):
             applied.append("proxy")
         else:
             skipped.append("proxy")
-    if rules.get("vpn") and opt.get("vpn"):
-        if have_fn("nmcli"):
-            v = opt["vpn"]
-            find = ('n=$(nmcli -t -f NAME,TYPE connection show | awk -F: \'$2=="vpn"||$2=="wireguard"{print $1}\' | grep -Fx "%s" | head -1); '
-                    '[ -z "$n" ] && n=$(for x in $(nmcli -t -f NAME,TYPE connection show | awk -F: \'$2=="vpn"||$2=="wireguard"{print $1}\'); do '
-                    'nmcli -g vpn.data connection show "$x" 2>/dev/null | grep -q "%s" && echo "$x" && break; done); [ -n "$n" ]' % (v, v))
-            steps.append(("VPN %s" % v if connected else "VPN down",
-                          find + (' && nmcli connection up "$n"' if connected else ' && nmcli connection down "$n" 2>/dev/null || true')))
-            applied.append("vpn")
-        else:
-            skipped.append("vpn")
+    # (the VPN is not here: it is this seat's own choice, made on the dock's page — see Engine._vpn_step)
     # -- rules that are not about an option
     if rules.get("wifi_off"):
         if have_fn("nmcli"):
@@ -1173,7 +1168,7 @@ def desk_plan(desk, seat, connected, iface, have_fn=None):
 
 def take_snapshot():
     """How the laptop is set up right now, as the dock will keep it (under 400 bytes):
-    screens, sound in and out, volume, keyboard layout, VPNs that are up."""
+    screens, sound in and out, volume, keyboard layout."""
     snap = {}
     try:
         n = 0
@@ -1200,11 +1195,7 @@ def take_snapshot():
         m = re.search(r"\('xkb',\s*'([^']+)'\)", out) if rc == 0 else None
         if m:
             snap["keyboard"] = m.group(1)[:20]
-    if have("nmcli"):
-        rc, out = run(["nmcli", "-t", "-f", "NAME,TYPE,STATE", "connection", "show", "--active"], timeout=5)
-        vpns = [l.split(":")[0] for l in out.splitlines() if rc == 0 and l.count(":") >= 2 and l.split(":")[1] in ("vpn", "wireguard")]
-        if vpns:
-            snap["vpn"] = vpns[:2]
+    # (no VPN here since 17 Nov 2026: the VPN is chosen on the dock's page and kept as the seat's pick)
     text = json.dumps(snap, separators=(",", ":"))
     while len(text.encode("utf-8")) > 390 and snap:
         snap.pop(sorted(snap)[-1])
@@ -1229,14 +1220,13 @@ def snapshot_words(text):
         bits.append("%d %%" % d["volume"])
     if "keyboard" in d:
         bits.append("keyboard: " + d["keyboard"])
-    if "vpn" in d:
-        bits.append("VPN: " + ", ".join(d["vpn"]))
     return " · ".join(bits) or "saved"
 
 
 def restore_plan(text, have_fn=None):
-    """Steps that put a saved configuration back: sound, volume, keyboard, VPN.
-    Screens are what the desk has; nothing to set."""
+    """Steps that put a saved configuration back: sound, volume, keyboard.
+    Screens are what the desk has; nothing to set. (A configuration saved before 17 Nov 2026 may
+    name VPNs; they are left alone — the seat's pick decides the VPN now.)"""
     have_fn = have_fn or have
     try:
         d = json.loads(text) if text else {}
@@ -1252,10 +1242,249 @@ def restore_plan(text, have_fn=None):
             steps.append(("volume %d %%" % d["volume"], ["pactl", "set-sink-volume", "@DEFAULT_SINK@", "%d%%" % int(d["volume"])]))
     if have_fn("gsettings") and d.get("keyboard"):
         steps.append(("keyboard %s" % d["keyboard"], ["gsettings", "set", "org.gnome.desktop.input-sources", "sources", "[('xkb', '%s')]" % d["keyboard"]]))
-    if have_fn("nmcli"):
-        for v in d.get("vpn", []):
-            steps.append(("VPN %s" % v, ["nmcli", "connection", "up", v]))
     return steps
+
+
+# --------------------------------------------------------------------------- #
+#  VPN — chosen on the dock's page, made here
+#
+#  The keys never leave this laptop: a VPN is a NetworkManager connection (WireGuard, or any VPN
+#  the laptop already has). The dock keeps one name per seat — the pick — and, in RAM, the list of
+#  names this laptop reports so its page can show them. Everything below goes through nmcli as the
+#  logged-in user; nothing needs root.
+# --------------------------------------------------------------------------- #
+VPN_TYPES = ("wireguard", "vpn")
+VPN_LIST_MAX = 200                       # what the dock shows
+VPN_GROUP_HERE = "On this laptop"        # VPNs that were not added through DockPilot
+VPN_GROUP_HAND = "Added by hand"         # single .conf files
+VPN_CONF_MAX = 64 * 1024                 # a WireGuard file is a few hundred bytes; refuse anything silly
+
+
+def nm_split(line):
+    """One line of `nmcli -t`: fields separated by ':', with ':' and '\\' inside a field escaped."""
+    out, cur, i = [], [], 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            cur.append(line[i + 1])
+            i += 2
+            continue
+        if ch == ":":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    out.append("".join(cur))
+    return out
+
+
+def vpn_connections(run_fn=None):
+    """The VPNs NetworkManager has: [{"name", "uuid", "type", "active"}], WireGuard and classic VPNs."""
+    run_fn = run_fn or run
+    rc, out = run_fn(["nmcli", "-t", "-f", "NAME,UUID,TYPE,ACTIVE", "connection", "show"], timeout=10)
+    cons = []
+    if rc != 0:
+        return cons
+    for line in out.splitlines():
+        f = nm_split(line)
+        if len(f) >= 4 and f[2] in VPN_TYPES and f[0]:
+            cons.append({"name": f[0], "uuid": f[1], "type": f[2], "active": f[3] == "yes"})
+    return cons
+
+
+def vpn_file_load(path=None):
+    d = load_json(path or VPN_FILE, {})
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("groups", {})           # uuid -> group name
+    d.setdefault("mine", "")             # the VPN DockPilot brought up, by name
+    return d
+
+
+def vpn_file_save(d, path=None):
+    save_json(path or VPN_FILE, d)
+
+
+def vpn_listing(cons, groups):
+    """What goes to the dock: [(group, name)], imported groups first (A–Z), then single files, then
+    whatever else the laptop has. One entry per name; at most VPN_LIST_MAX."""
+    rows, seen = [], set()
+    for c in cons:
+        if c["name"] in seen:
+            continue
+        seen.add(c["name"])
+        rows.append((groups.get(c["uuid"]) or VPN_GROUP_HERE, c["name"]))
+
+    def order(r):
+        g = r[0]
+        return (2 if g == VPN_GROUP_HERE else 1 if g == VPN_GROUP_HAND else 0, g.lower(), r[1].lower())
+    rows.sort(key=order)
+    return rows[:VPN_LIST_MAX]
+
+
+def vpn_group_name(zip_path):
+    """A provider's zip → the name its servers are grouped under: the first word of the file name
+    when that is a name (mullvad_wireguard_linux_all.zip → Mullvad), else the file name."""
+    stem = os.path.splitext(os.path.basename(zip_path))[0].lstrip(".")
+    if stem.lower() == "zip":
+        stem = ""
+    first = re.split(r"[\s_.\-]+", stem.strip())[0] if stem.strip() else ""
+    if len(first) >= 3 and first.isalpha() and first.lower() not in ("wireguard", "config", "configs", "vpn", "servers", "linux", "all"):
+        return (first[0].upper() + first[1:])[:32]
+    return re.sub(r"[\s_]+", " ", stem).strip()[:32] or "Imported"
+
+
+def _wg_ifname(stem, taken):
+    """nmcli names the WireGuard interface after the file. A name Linux takes (15 characters, no
+    spaces) is kept; anything else gets wg- and a short hash, and the connection keeps the full name."""
+    if re.fullmatch(r"[A-Za-z0-9_=+.\-]{1,15}", stem) and stem not in taken and stem not in (".", ".."):
+        return stem
+    base = "wg-" + hashlib.sha1(stem.encode("utf-8")).hexdigest()[:8]
+    name, n = base, 1
+    while name in taken:
+        n += 1
+        name = "%s-%d" % (base[:11], n)
+    return name
+
+
+def _looks_like_wireguard(text):
+    return "[Interface]" in text and "PrivateKey" in text and "[Peer]" in text
+
+
+def vpn_import(paths, run_fn=None, log=None, vpn_path=None, room=None):
+    """Add WireGuard files to NetworkManager: single .conf files, or a provider's .zip of them.
+    Returns {"added": [names], "skipped": [(file, why)], "groups": [group names]}.
+    Each file becomes a connection named after the file, set not to connect by itself: the dock's
+    page decides which one is up. The key in the file goes to NetworkManager and nowhere else."""
+    run_fn = run_fn or run
+    log = log or (lambda m: None)
+    added, skipped, groups_used = [], [], []
+    state = vpn_file_load(vpn_path)
+    cons = vpn_connections(run_fn)
+    names = {c["name"] for c in cons}
+    room = (VPN_LIST_MAX - len(names)) if room is None else room
+    taken = set(names)
+    try:
+        taken |= set(os.listdir("/sys/class/net"))
+    except OSError:
+        pass
+    work = tempfile.mkdtemp(prefix="dockpilot-vpn-")
+    os.chmod(work, 0o700)
+    try:
+        jobs = []                                         # (shown file name, group, text)
+        for p in paths:
+            base = os.path.basename(p)
+            low = base.lower()
+            try:
+                if low.endswith(".zip"):
+                    group = vpn_group_name(p)
+                    with zipfile.ZipFile(p) as z:
+                        members = [m for m in z.infolist() if not m.is_dir() and m.filename.lower().endswith(".conf")]
+                        if not members:
+                            skipped.append((base, "no WireGuard .conf files inside"))
+                        for m in sorted(members, key=lambda m: m.filename.lower()):
+                            if m.file_size > VPN_CONF_MAX:
+                                skipped.append((os.path.basename(m.filename), "too large to be a WireGuard file"))
+                                continue
+                            jobs.append((os.path.basename(m.filename), group, z.read(m).decode("utf-8", "replace")))
+                elif low.endswith(".conf"):
+                    if os.path.getsize(p) > VPN_CONF_MAX:
+                        skipped.append((base, "too large to be a WireGuard file"))
+                        continue
+                    with open(p, encoding="utf-8", errors="replace") as f:
+                        jobs.append((base, VPN_GROUP_HAND, f.read()))
+                else:
+                    skipped.append((base, "not a .conf or a .zip"))
+            except (OSError, zipfile.BadZipFile) as e:
+                skipped.append((base, "cannot be read: %s" % e))
+        for shown, group, text in jobs:
+            name = os.path.splitext(shown)[0].strip()
+            if not name:
+                skipped.append((shown, "no name"))
+                continue
+            if len(name.encode("utf-8")) > 64:
+                name = name.encode("utf-8")[:64].decode("utf-8", "ignore")
+            if not _looks_like_wireguard(text):
+                skipped.append((shown, "not a WireGuard file"))
+                continue
+            if name in names:
+                skipped.append((shown, "already there"))
+                continue
+            if room <= 0:
+                skipped.append((shown, "the dock shows %d VPNs; this one is over" % VPN_LIST_MAX))
+                continue
+            ifname = _wg_ifname(name, taken)
+            tmp = os.path.join(work, ifname + ".conf")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            rc, out = run_fn(["nmcli", "connection", "import", "type", "wireguard", "file", tmp], timeout=30)
+            os.remove(tmp)
+            m = re.search(r"\(([0-9a-fA-F-]{36})\)", out or "")
+            if rc != 0 or not m:
+                why = (out or "").strip().splitlines()[-1] if (out or "").strip() else "nmcli refused it"
+                skipped.append((shown, re.sub(r"^Error:\s*", "", why)[:120]))
+                continue
+            uuid = m.group(1)
+            # named after the file; never up by itself; and not left up by the import
+            run_fn(["nmcli", "connection", "modify", "uuid", uuid, "connection.id", name, "connection.autoconnect", "no"], timeout=15)
+            run_fn(["nmcli", "connection", "down", "uuid", uuid], timeout=15)
+            state["groups"][uuid] = group
+            names.add(name)
+            taken.add(ifname)
+            added.append(name)
+            room -= 1
+            if group not in groups_used:
+                groups_used.append(group)
+            log("# VPN added: %s (%s)" % (name, group))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        vpn_file_save(state, vpn_path)
+    return {"added": added, "skipped": skipped, "groups": groups_used}
+
+
+# opendock:// links: the dock's own page asks this laptop to do one of a fixed list of things.
+# Only the action's name is read. Nothing else in a link is ever used.
+URL_ACTIONS = ("vpn-import", "open")
+
+
+def url_action(url):
+    """opendock://vpn-import?x=1 -> "vpn-import"; anything not on the list -> None."""
+    scheme, sep, rest = str(url).partition(":")
+    if not sep or scheme.strip().lower() != "opendock":
+        return None
+    name = rest.lstrip("/").split("?", 1)[0].split("#", 1)[0].split("/", 1)[0].strip().lower()
+    return name if name in URL_ACTIONS else None
+
+
+def vpn_import_words(res):
+    """What the file window says when the import is done."""
+    if not res or not res.get("ok"):
+        return "DockPilot’s background service did not answer. Nothing was added."
+    added, skipped = res.get("added") or [], res.get("skipped") or []
+    lines = []
+    if len(added) == 1:
+        lines.append("VPN added manually to dock & to Computer")
+    elif added:
+        groups = [g for g in (res.get("groups") or []) if g != VPN_GROUP_HAND]
+        lines.append("%d VPNs added to dock & to Computer%s" % (len(added), (" (" + ", ".join(groups) + ")") if groups else ""))
+    else:
+        lines.append("Nothing was added.")
+    if skipped:
+        lines.append("")
+        lines.append("%d file%s left out:" % (len(skipped), "" if len(skipped) == 1 else "s"))
+        for f, why in skipped[:8]:
+            lines.append("  %s — %s" % (f, why))
+        if len(skipped) > 8:
+            lines.append("  … and %d more (see Logs in DockPilot)" % (len(skipped) - 8))
+    return "\n".join(lines)
+
+
+def vpn_error_words(out):
+    """The last thing nmcli said, without its 'Error:'."""
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    return re.sub(r"^Error:\s*", "", lines[-1])[:90] if lines else "the connection did not come up"
 
 
 # --------------------------------------------------------------------------- #
@@ -1726,6 +1955,15 @@ class Engine:
         self.native_last_state = None
         self.odlink = None
         self.od_snap = {}
+        self._od_seen = None                    # the options, rules and VPN pick last acted on: what changed since?
+        self.vpn_run = run                      # nmcli goes through here (tests put their own in)
+        self.vpn_view = {"state": "down", "active": "", "msg": "", "n": 0}   # what was last told to the dock
+        self._vpn_todo = set()                  # "apply" (make the pick true), "drop" (undock, by rule), "list" (publish again)
+        self._vpn_wake = threading.Event()
+        self._vpn_pub = None                    # the list as last published
+        self._vpn_state_pub = None
+        self._vpn_fail = None                   # (name, message) of a pick that would not come up; cleared by the next change
+        self._vpn_fail_at = 0.0
         if opendock_link:
             self._start_opendock()
 
@@ -1881,6 +2119,198 @@ class Engine:
             env["DOCK_IFACE"] = self.iface or ""
             run_commands(shell, log=self.log, env_extra=env)
         return True
+
+    # ---- changes made in the dock (its page, another program, this one) are acted on at once ----
+    def _od_view(self):
+        """The part of the desk and seat this laptop acts on, to tell what changed."""
+        desk, seat = self.od_desk() or {}, self.od_seat() or {}
+        return {"opt": {k: v for k, v in (desk.get("opt") or {}).items() if v},
+                "rules": {k: 1 for k, v in (seat.get("rules") or {}).items() if v},
+                "vpn": (seat.get("vpn") or "", bool(seat.get("vpn_on")))}
+
+    def _od_changed(self):
+        """The dock said its stored state moved (STATUS rev) and the desk and seat have been read
+        again. Whatever differs from what was last acted on is done now — no waiting for the next dock."""
+        if self.odlink is not None:
+            self.od_snap = self.odlink.snapshot()
+        if not self.od_snap.get("connected") or self.od_desk() is None:
+            return
+        new, old = self._od_view(), self._od_seen
+        self._od_seen = new
+        self._emit("opendock", "changed")
+        if old is None or not self.automation:
+            return
+        docked = bool((self.od_snap.get("status") or {}).get("docked"))
+        for oid in sorted(set(old["opt"]) | set(new["opt"])):
+            if old["opt"].get(oid, "") != new["opt"].get(oid, "") and docked:
+                self.apply_opt_now(oid, old["opt"].get(oid, ""), new["opt"].get(oid, ""))
+        for rid in sorted(set(old["rules"]) | set(new["rules"])):
+            if bool(old["rules"].get(rid)) != bool(new["rules"].get(rid)) and rid != "proxy":   # the proxy "rule" is the option's switch: done above
+                self.apply_rule_now(rid, bool(new["rules"].get(rid)))
+        if old["vpn"] != new["vpn"]:
+            self._vpn_fail = None
+        if old["vpn"] != new["vpn"] or new["vpn"][1]:  # also when nothing differs: choosing the same VPN again on the page means "now"
+            self._vpn_request("apply")
+
+    def _run_steps(self, steps):
+        shell = []
+        for note, step in steps:
+            if isinstance(step, list):
+                self.do(step, note=note)
+            else:
+                self.log("# " + note)
+                shell.append(step)
+        if shell:
+            env = self.od_env()
+            env["DOCK_IFACE"] = self.iface or ""
+            run_commands(shell, log=self.log, env_extra=env)
+
+    def apply_opt_now(self, oid, old, new):
+        """A desk option changed (or was switched on or off) while docked: undo the old value,
+        apply the new one, and remember it so undock undoes what is in force now."""
+        if not self.automation or oid not in OPT_TOOLS:
+            return False
+        seat = {"rules": {"proxy": 1}}
+        steps = []
+        if old:
+            steps += desk_plan({"opt": {oid: old}}, seat, False, self.iface)[0]
+        if new:
+            steps += desk_plan({"opt": {oid: new}}, seat, True, self.iface)[0]
+        if self.desk_applied:
+            desk = dict(self.desk_applied.get("desk") or {})
+            opt = dict(desk.get("opt") or {})
+            opt[oid] = new
+            desk["opt"] = opt
+            self.desk_applied["desk"] = desk
+            if oid == "proxy":
+                st = dict(self.desk_applied.get("seat") or {})
+                rules = dict(st.get("rules") or {})
+                if new:
+                    rules["proxy"] = 1
+                else:
+                    rules.pop("proxy", None)
+                st["rules"] = rules
+                self.desk_applied["seat"] = st
+            save_json(DESK_STATE_FILE, self.desk_applied)
+        if not steps:
+            return False
+        self.log("# option %s %s — applied now" % (oid, ("set to " + new) if new else "off"))
+        self._run_steps(steps)
+        return True
+
+    # ---- the VPN: the seat's pick, made true here -------------------------------------------
+    def _vpn_request(self, *what):
+        self._vpn_todo.update(what)
+        self._vpn_wake.set()
+
+    def _vpn_loop(self):
+        while True:
+            self._vpn_wake.wait(5.0)             # also every few seconds: a VPN may have been added or dropped by hand
+            self._vpn_wake.clear()
+            try:
+                self._vpn_step()
+            except Exception as e:               # nothing here may stop the service
+                self.log("# VPN: %s" % e)
+
+    def _vpn_nm(self, verb, con):
+        self.log("$ nmcli connection %s %s" % (verb, con["name"]))
+        rc, out = self.vpn_run(["nmcli", "connection", verb, "uuid", con["uuid"]], timeout=45)
+        if rc != 0:
+            self.log(out or "(exit %d)" % rc)
+        return rc, out
+
+    def _vpn_step(self):
+        todo, self._vpn_todo = self._vpn_todo, set()
+        if not have("nmcli") and self.vpn_run is run:
+            return
+        state = vpn_file_load()
+        cons = vpn_connections(self.vpn_run)
+        by_name = {}
+        for c in cons:
+            by_name.setdefault(c["name"], c)
+        mine = state.get("mine") or ""
+        snap = self.od_snap or {}
+        link = self.odlink
+        dock = link.dock if link is not None else None
+        on_dock = bool(snap.get("connected")) and dock is not None and dock.has_vpn()
+        seat = (snap.get("seat") or {}) if on_dock else {}
+        docked = on_dock and bool((snap.get("status") or {}).get("docked"))
+        pick, on = seat.get("vpn") or "", bool(seat.get("vpn_on"))
+
+        def down(names):
+            for n in names:
+                c = by_name.get(n)
+                if c and c["active"]:
+                    self._vpn_nm("down", c)
+                    c["active"] = False
+
+        if "drop" in todo:                           # undocked, and the rule says the VPN goes with the desk
+            down({mine, (((self.desk_applied or {}).get("seat") or {}).get("vpn") or "")} - {""} | ({pick} - {""}))
+            mine = ""
+        if self._vpn_fail and docked and pick and on and time.time() - self._vpn_fail_at > 30:
+            todo.add("apply")                        # a pick that would not come up is tried again every half minute
+        if "apply" in todo and docked:
+            if pick and on:
+                c = by_name.get(pick)
+                if c is None:
+                    self._vpn_fail, self._vpn_fail_at = (pick, "this laptop has no VPN called that"), time.time()
+                elif not c["active"]:
+                    if on_dock:
+                        self._vpn_tell(dock, "connecting", pick, "")
+                    down({mine} - {pick, ""})
+                    rc, out = self._vpn_nm("up", c)
+                    if rc == 0:
+                        c["active"] = True
+                        mine, self._vpn_fail = pick, None
+                        self.log("# VPN %s is up (the pick for this desk)" % pick)
+                    else:
+                        self._vpn_fail, self._vpn_fail_at = (pick, vpn_error_words(out)), time.time()
+                else:
+                    down({mine} - {pick, ""})
+                    mine, self._vpn_fail = pick, None
+            else:                                    # switched off, or nothing chosen: what DockPilot brought up comes down
+                down({mine, pick} - {""})
+                mine, self._vpn_fail = "", None
+        if mine != (state.get("mine") or ""):
+            state["mine"] = mine
+            vpn_file_save(state)
+        if not on_dock:
+            return
+        listing = vpn_listing(cons, state.get("groups") or {})
+        if listing != self._vpn_pub or "list" in todo:
+            try:
+                dock.vpn_publish(listing)
+                self._vpn_pub = listing
+            except opendock.DockError as e:
+                self.log("# VPN list not sent: %s" % e)
+                return
+        up = [c["name"] for c in cons if c["active"]]
+        if self._vpn_fail and not (self._vpn_fail[0] in up):
+            view = ("failed", self._vpn_fail[0], self._vpn_fail[1])
+        elif up:
+            view = ("up", pick if pick in up else up[0], "")
+        else:
+            view = ("down", "", "")
+        if view != self._vpn_state_pub or "list" in todo:
+            self._vpn_tell(dock, *view)
+
+    def _vpn_tell(self, dock, state, name, msg):
+        try:
+            dock.vpn_state(state, name, msg)
+            self._vpn_state_pub = (state, name, msg)
+            self.vpn_view = {"state": state, "active": name, "msg": msg, "n": len(self._vpn_pub or [])}
+        except opendock.DockError as e:
+            self.log("# VPN state not sent: %s" % e)
+
+    def vpn_import_files(self, paths):
+        """Files chosen in DockPilot's file window (opened from the dock's page): into NetworkManager,
+        then the dock is told the new list."""
+        res = vpn_import([str(p) for p in paths], run_fn=self.vpn_run, log=self.log)
+        self.log("# VPN import: %d added, %d left out" % (len(res["added"]), len(res["skipped"])))
+        for f, why in res["skipped"][:20]:
+            self.log("#   %s — %s" % (f, why))
+        self._vpn_request("list")
+        return res
 
     def restore_snapshot(self, text=None):
         """Put the seat's saved configuration back."""
@@ -2368,7 +2798,8 @@ class Engine:
             on_connect=lambda l: self.marshal(self._od_connected),
             on_disconnect=lambda l: self.marshal(self._od_disconnected),
             on_event=lambda t: self.marshal(lambda: self._od_event(t)),
-            on_log=lambda es: self.marshal(lambda: self._od_new_log(es)))
+            on_log=lambda es: self.marshal(lambda: self._od_new_log(es)),
+            on_change=lambda l: self.marshal(self._od_changed))
 
         def worker():
             while True:
@@ -2377,8 +2808,10 @@ class Engine:
                 except Exception as e:
                     self.odlink.error = str(e)
                 self.od_snap = self.odlink.snapshot()
-                time.sleep(2.0)
+                time.sleep(1.0)                  # a change made on the dock's page is seen within a second
         threading.Thread(target=worker, daemon=True).start()
+        if self.automation:
+            threading.Thread(target=self._vpn_loop, daemon=True).start()
 
     def od_env(self):
         snap = self.od_snap
@@ -2391,12 +2824,15 @@ class Engine:
         self.od_snap = self.odlink.snapshot()
         i = self.od_snap.get("identity") or {}
         self.log("# OpenDock %s (%s, fw %s) on %s" % (i.get("serial"), i.get("model"), i.get("fw"), self.od_snap.get("port")))
+        self._od_seen = self._od_view()
+        self._vpn_pub = self._vpn_state_pub = None   # a dock that has just appeared knows nothing of this laptop's VPNs
         if self.automation:
             st = self.od_snap.get("status") or {}
             if st.get("docked", True):               # a 0.5 dock that is not docked will say so with EVENT dock
                 self.apply_desk(True)
                 if ((self.od_seat() or {}).get("snap")):
                     self.restore_snapshot()
+            self._vpn_request("list", "apply")
             n = run_macros(self.macro_store, "opendock_connect", log=self.log, dock_model=i.get("model", ""), **self.od_env())
             if n:
                 self.log("# %d macro(s) fired" % n)
@@ -2406,8 +2842,12 @@ class Engine:
         env = self.od_env()
         self.od_snap = self.odlink.snapshot()
         self.log("# OpenDock gone (%s)" % (self.od_snap.get("error") or "unplugged"))
+        self._od_seen = None
         if self.automation:
+            drop = bool((((self.desk_applied or {}).get("seat") or {}).get("rules") or {}).get("vpn_drop"))
             self.apply_desk(False)
+            if drop:                                 # the cable is out: that is the undock
+                self._vpn_request("drop")
             run_macros(self.macro_store, "opendock_disconnect", log=self.log, dock_model=env.get("DOCK_MODEL", ""), **env)
         self._emit("opendock", "disconnected")
 
@@ -2419,10 +2859,16 @@ class Engine:
             self.apply_desk(text == "dock")          # firmware 0.5 pushes these the moment VBUS changes
             if text == "dock" and (self.od_seat() or {}).get("snap"):
                 self.restore_snapshot()
+            if text == "dock":
+                self._vpn_request("apply")
+            elif ((self.od_seat() or {}).get("rules") or {}).get("vpn_drop"):
+                self._vpn_request("drop")
         self._emit("opendock", "event:" + text)
 
     def _od_new_log(self, entries):
         self.od_snap = self.odlink.snapshot()
+        # an older dock logs every read of the desk and every write to a seat; neither is worth a line
+        entries = [e for e in entries if e.get("ev") != "desk_read" and not (e.get("ev") == "desk_change" and e.get("v") == 5)]
         for e in entries[-5:]:
             self.log("# OpenDock log: " + opendock.describe(e))
         if len(entries) > 5:
@@ -2467,8 +2913,7 @@ class Engine:
             try:
                 self.odlink.desk_action(name, *args)
                 msg = note or "saved"
-                if name == "set_rule" and len(args) == 2:
-                    self.marshal(lambda: self.apply_rule_now(args[0], args[1]))
+                self.marshal(self._od_changed)       # acted on at once, the same way as a change made on the dock's page
             except opendock.DockBusy as e:
                 msg = "not saved — dock busy: %s" % e
             except opendock.DockError as e:
@@ -2651,7 +3096,7 @@ class Service:
         cmd = req.get("cmd")
         if cmd == "status":
             return {"ok": True, "opendock": e.od_snap, "rules": e.rules, "log": e.log_lines[-50:],
-                    "nic": e.status_dict()["nic"], "version": APP_VERSION}
+                    "nic": e.status_dict()["nic"], "version": APP_VERSION, "build": APP_BUILD}
         if cmd == "log":
             return {"ok": True, "log": e.log_lines[-200:]}
         if cmd in ("od_set", "od_clear") and not (e.odlink and e.odlink.connected):
@@ -2715,6 +3160,13 @@ class Service:
             return {"ok": True, "phrase": e.seat_phrase, "id": e.seat_id}
         if cmd == "apply_desk":
             return {"ok": e.apply_desk(bool(req.get("connected", True)))}
+        if cmd == "vpn_import":                      # from the file window that opendock://vpn-import opens
+            paths = [p for p in (req.get("paths") or []) if isinstance(p, str)]
+            res = e.vpn_import_files(paths)
+            return {"ok": True, "added": res["added"], "skipped": res["skipped"], "groups": res["groups"]}
+        if cmd == "vpn":
+            return {"ok": True, "vpn": e.vpn_view, "pick": (e.od_seat() or {}).get("vpn") or "", "on": bool((e.od_seat() or {}).get("vpn_on")),
+                    "connected": bool((e.od_snap or {}).get("connected"))}
         if cmd == "reload":
             e.reload_rules_if_changed()
             return {"ok": True}
@@ -2841,7 +3293,7 @@ def ensure_extension_enabled():
 def service_main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["--version"]:
-        print("dockpilotd " + APP_VERSION)
+        print("dockpilotd %s (build of %s)" % (APP_VERSION, APP_BUILD))
         return 0
     if already_running():
         print("dockpilotd is already running (%s)" % SOCKET_PATH, file=sys.stderr)

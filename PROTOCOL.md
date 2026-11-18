@@ -39,7 +39,7 @@ line. That's the whole protocol — you can try it with any serial terminal.
 | `IDENTIFY` | `DOCKPILOT 1 <firmware> <model> <chip id> <serial>` | "I am a dock." The chip id is burned in at the factory. |
 | `PING` | `PONG` | Are you there? |
 | `CAPS` | one line of JSON | What can you do? (`temp`, `log`, `log_max`) |
-| `STATUS` | one line of JSON | How are you right now? |
+| `STATUS` | one line of JSON | How are you right now? Includes `rev` — a counter that goes up with every stored change (settings, desk, seats) and with a repeated `SET VPN`/`SET VPNON`; a client that sees it move reads the desk and its seat again and acts on what differs — and `host` (a program holds the serial port open) and `host_seat` (the seat that program chose with `SEAT`, or `null`). The dock's own page reads these over HTTP to know that DockPilot is running on the laptop, and then works as DockPilot's seat. |
 | `SET TIME <unix seconds>` | `OK` | Here's the time. The dock has no clock of its own — send this every time you connect. |
 | `SET NAME "<text>"` | `OK` | A friendly name. Kept in the dock's flash, survives power loss. |
 | `SET ASSETTAG "<text>"` | `OK` | Your inventory number. |
@@ -74,10 +74,11 @@ that has this says `"desk": {"opts": 9, "keys": 64, "seats": 8, "rules": 8}` in 
 
 | You send | The dock answers | What it means |
 |---|---|---|
-| `GET DESK` | one line of JSON | `tag`, every option (`""` = not set), how many `keys` and `seats`. Logged as `desk_read` once per visit: the first read after the dock starts, after a laptop docks or undocks, or after a program opens the serial port — not every time a client looks again, and at most once in ten minutes. |
+| `GET DESK` | one line of JSON | `tag`; `opt`: every option as a laptop should apply it (`""` = not set, **or switched off**); `held`: the values of options that are switched off; `off`: their ids; how many `keys` and `seats`. Apply what is in `opt` and nothing else. Reading the desk is not logged. |
 | `GET SCHEMA` | one JSON line per option, then `END` | The options this dock knows: `id`, `label`, `hint`, `type` (`int` or `str`), `min`, `max`. Show these; don't hard-code them. |
 | `SET TAG "<text>"` | `OK` | What people call this desk. (The same field as `SET NAME`.) |
-| `SET OPT <id> "<value>"` | `OK` | One desk option. Checked against the schema: `vlan` 1–4094, `mtu` 576–9000, the rest text up to 64 bytes. `""` clears it. |
+| `SET OPT <id> "<value>"` | `OK` | One desk option. Checked against the schema: `vlan` 1–4094, the rest text up to 64 bytes. `""` clears it. The options are `vlan`, `addr`, `dns`, `proxy` (`mtu`, `domain`, `ntp`, `tz` and `vpn` are retired: unknown to `SET OPT`, taken and dropped inside an `IMPORT`. The VPN is the seat's own choice now: `SET VPN`.) |
+| `SET USE <id> 0\|1` | `OK` | An option's switch. `0` keeps the value in the dock and hands it to no laptop: it reads `""` under `opt` and moves to `held`. `1` (how every option starts) puts it back. `GET OPT <id>` answers `{"id", "value", "use"}`. `EXPORT` writes `SET USE <id> 0` for each option that is off; a file without such lines defines a desk with everything on. |
 | `GET OPT <id>` | `{"id": "vlan", "value": "30"}` | One option. |
 | `SET KEY <name> "<value>"` | `OK` | Free storage: 64 keys (32 on firmware 0.6), names `a-z 0-9 _` up to 24 chars, values up to 128 bytes. The dock keeps them; it doesn't need to understand them. `""` removes. |
 | `DEL KEY <name>` | `OK` | Remove one. |
@@ -93,8 +94,8 @@ are, and a second laptop given the same key is the same seat at every dock.
 | You send | The dock answers | What it means |
 |---|---|---|
 | `SEAT <id>` / `SEAT NONE` | `OK` | This connection's seat. Nothing is written until the seat sets something. Cleared when you disconnect. |
-| `GET SEAT` | one line of JSON | `rules` (`{"wifi_off": 1, …}`), `cmd` (`{"dock": [lines], "undock": [lines]}`), `snap` (the saved configuration, text the laptop wrote), `snap_t` (when), `autosave`, `new` (no record yet). `{"seat": null}` if none selected. |
-| `GET RULES` | one JSON line per rule, then `END` | The rules this dock knows: `id`, `label`, `hint`. Show these; a newer dock may have more. |
+| `GET SEAT` | one line of JSON | `rules` (`{"wifi_off": 1, …}`), `cmd` (`{"dock": [lines], "undock": [lines]}`), `snap` (the saved configuration, text the laptop wrote), `snap_t` (when), `autosave`, `new` (no record yet). `{"seat": null}` if none selected. `rules` also carries `proxy`, which is no longer the seat's to choose: it reads `1` when the desk option `proxy` is set and switched on. `vpn` and `vpn_on` are this seat's VPN choice (below). |
+| `GET RULES` | one JSON line per rule, then `END` | The rules a seat can switch: `id`, `label`, `hint`. Show these; a newer dock may have more. (`proxy` is not listed and `SET RULE` refuses it: it follows the option. `vpn_drop` — drop the VPN at undock — replaced the old `vpn` rule on 17 Nov 2026.) |
 | `SET RULE <id> 0\|1` | `OK` | One switch. |
 | `SET CMD dock\|undock "<lines>"` | `OK` | Your own commands, `\n` between lines: up to 4 lines of 120 bytes. |
 | `SET SNAP "<text>"` | `OK` | The saved configuration, up to 400 bytes, whatever the laptop wants to restore later. Stamped with the dock's clock. |
@@ -104,6 +105,36 @@ are, and a second laptop given the same key is the same seat at every dock.
 Values are quoted like `SET NAME`: `"…"` with `\"`, `\\` and (new) `\n`. Writes follow the same
 flash discipline as everything else — the same field no more than once in 10 s, the shared write
 budget — and reads never cost anything. A ninth seat gets `ERR full`; so does a 65th key.
+
+### The VPN (firmware build of 17 Nov 2026)
+
+The VPN is chosen on the dock's page and made by the laptop. The dock holds two things, and no keys:
+
+**The seat's choice**, stored like the rest of the seat:
+
+| Command | Reply | What it does |
+|---|---|---|
+| `SET VPN "<name>"` | `OK` | The VPN this laptop uses at this desk — a name the laptop knows (a NetworkManager connection). Choosing switches it on. `""` forgets it. May be repeated after 2 s (other fields: 10 s). Not logged. |
+| `SET VPNON 0\|1` | `OK` | `0` keeps the choice and connects nothing. |
+
+`GET SEAT` carries `"vpn": "<name>"` and `"vpn_on": 0|1`. Sending the same choice again stores nothing
+but still moves `rev`: it means "this one, now" (the VPN may have dropped).
+
+**What the laptop reports**, kept in RAM for the page, gone when the program lets go of the port. Only
+the program on the serial port may send these (`ERR forbidden` over HTTP); they cost no flash and no budget:
+
+| Command | Reply | What it does |
+|---|---|---|
+| `VPN BEGIN` | `OK` | Start a new list (the old one is dropped). |
+| `VPN ADD "<group>\n<name>"` | `OK` | One VPN the laptop has. Up to 200 (`CAPS` `desk.vpn`), then `ERR full`. Name ≤ 64 bytes, group ≤ 32. |
+| `VPN END` | `OK` | The list is complete. |
+| `VPN STATE up\|down\|connecting\|failed "<name>\n<message>"` | `OK` | Which one is up, or why the choice did not come up. |
+| `GET VPN [from [max]]` | one JSON line, then one per VPN, then `END` | `{"app", "state", "active", "msg", "n", "loading", "max"}` then `{"n": name, "g": group}` from index `from`, at most 60 per answer. `app` is false until a program on the serial port has reported. Anyone may read. |
+
+The laptop (DockPilot) does the rest: at dock, and whenever `rev` moves, it brings the seat's choice up
+through NetworkManager, takes the previous one down, and reports the result. At undock it leaves the
+VPN up unless the seat's rule `vpn_drop` is on. The dock's page starts an import on the laptop with the
+link `opendock://vpn-import`; nothing but the action's name travels in that link.
 
 ### The web face (firmware 1.0, the C line)
 
@@ -154,7 +185,7 @@ curl -H 'X-OpenDock: 1' -X DELETE http://opendock.local/key/room
 ```
 
 **The app, carried by the dock.** A dock that has DockPilot baked in says so in `CAPS`
-(`"web": {…, "app": "1.2"}`) and serves it: `GET /dockpilot.deb` (Ubuntu package) and
+(`"web": {…, "app": "1.3"}`) and serves it: `GET /dockpilot.deb` (Ubuntu package) and
 `GET /dockpilot.whl` (Python wheel), each with its real file name in `Content-Disposition`. The
 page offers the .deb wherever DockPilot is needed. Linux only for now.
 
@@ -196,7 +227,7 @@ and sometimes `v` (a detail).
 | `log_cleared` | `CLEAR LOG` was used | |
 | `fault` | the firmware hit a problem and carried on | |
 | `desk_change` | the desk was written (firmware 0.6) | 2 option · 3 key · 4 import · 5 seat · 6 seat forgotten (1 is unused: the tag logs as `config_change` 1) |
-| `desk_read` | the desk was handed to a laptop (`GET DESK`), once per visit | |
+| `desk_read` | (builds before 16 Nov 2026 only) a laptop read the desk. No longer written: `dock` and `undock` say who came and went. | |
 | `fw_update` | a firmware update (firmware 1.0, C line) | 1 new firmware written, restarting into it · 2 new firmware running (it confirmed itself) |
 
 The dock keeps the newest 2048 entries. To collect the log without fetching anything twice,

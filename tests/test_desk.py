@@ -32,11 +32,13 @@ def test_seat_phrase_round_trip_and_id(tmp_path):
 
 def test_desk_plan_applies_and_undoes_options_and_rules():
     desk = {"tag": "Desk 22", "opt": {"vlan": "30", "mtu": "1500", "addr": "10.3.22.5/24 10.3.22.1", "dns": "10.3.0.53,10.3.0.54",
-                                       "domain": "lon.corp", "ntp": "10.3.0.1", "tz": "Europe/London", "proxy": "proxy.lon.corp:3128", "vpn": "vpn.corp.com"}}
-    seat = {"rules": {"wifi_off": 1, "audio_dock": 1, "lock_undock": 1, "mute_undock": 1, "touchpad_off": 1, "vpn": 1, "proxy": 1, "tile": 1}}
+                                       "domain": "lon.corp", "ntp": "10.3.0.1", "tz": "Europe/London", "proxy": "proxy.lon.corp:3128"}}
+    seat = {"rules": {"wifi_off": 1, "audio_dock": 1, "lock_undock": 1, "mute_undock": 1, "touchpad_off": 1, "vpn_drop": 1, "proxy": 1, "tile": 1},
+            "vpn": "Mullvad SE", "vpn_on": 1}
     steps, applied, skipped = core.desk_plan(desk, seat, True, "enx0", HAVE_ALL)
     notes = [n for n, _ in steps]
-    assert applied == ["vlan", "mtu", "addr", "dns", "tz", "proxy", "vpn"] and skipped == ["ntp"]
+    assert applied == ["vlan", "mtu", "addr", "dns", "tz", "proxy"] and skipped == ["ntp"]
+    assert not any("VPN" in n for n in notes)                                     # the VPN is the seat's pick: not part of the plan (tests/test_vpn.py)
     assert any("VLAN 30" in n for n in notes) and any("proxy" in n for n in notes) and "Wi-Fi off" in notes
     assert "lock the screen" not in notes and "mute" not in notes                 # undock-only
     joined = " ".join(x for _, x in steps if isinstance(x, str))
@@ -46,20 +48,20 @@ def test_desk_plan_applies_and_undoes_options_and_rules():
     assert "lock the screen" in notes and "mute" in notes and "Wi-Fi on" in notes and "VLAN removed" in notes and "proxy off" in notes
     # without the tools, options are skipped and said so; the tile rule never runs anything
     steps, applied, skipped = core.desk_plan(desk, seat, True, "enx0", HAVE_NONE)
-    assert applied == [] and set(skipped) >= {"vlan", "mtu", "addr", "dns", "tz", "proxy", "vpn", "ntp"} and steps == []
-    # proxy and vpn only by rule
+    assert applied == [] and set(skipped) >= {"vlan", "mtu", "addr", "dns", "tz", "proxy", "ntp"} and steps == []
+    # the proxy only when the dock says it is switched on (it reports that as the seat's proxy rule)
     steps, applied, skipped = core.desk_plan(desk, {"rules": {}}, True, "enx0", HAVE_ALL)
-    assert "proxy" not in applied and "vpn" not in applied
+    assert "proxy" not in applied
     # no desk at all
     assert core.desk_plan(None, None, True, "enx0", HAVE_ALL) == ([], [], [])
 
 
 def test_snapshot_words_and_restore_plan():
     text = json.dumps({"screens": 2, "sink": "alsa_output.usb-dock.analog-stereo", "volume": 40, "keyboard": "gb", "vpn": ["corp"]})
-    assert core.snapshot_words(text) == "2 screens · sound: dock · 40 % · keyboard: gb · VPN: corp"
+    assert core.snapshot_words(text) == "2 screens · sound: dock · 40 % · keyboard: gb"      # a VPN in an older snapshot is not shown
     assert core.snapshot_words("") == "nothing saved yet" and core.snapshot_words("{bad") == "unreadable"
     steps = core.restore_plan(text, HAVE_ALL)
-    assert [n for n, _ in steps] == ["sound output", "volume 40 %", "keyboard gb", "VPN corp"]
+    assert [n for n, _ in steps] == ["sound output", "volume 40 %", "keyboard gb"]            # nor brought up: the pick decides
     assert core.restore_plan(text, HAVE_NONE) == [] and core.restore_plan("{bad", HAVE_ALL) == []
 
 
